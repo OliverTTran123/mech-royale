@@ -131,6 +131,7 @@ class Bot:
         healthy = frac >= 0.8
         loot = dodge = None
         weapon = self._early_weapon(obs, me, t) if config.LOOT and not urgent else None
+        drop = self._drop_commit(obs, me, mechs, t) if config.LOOT and not urgent else None
         if config.LOOT and calm and not urgent:
             loot = self._loot(obs, me, npcs, t, healthy)
         if config.THREAT_RETREAT:
@@ -145,6 +146,8 @@ class Bot:
             boost = not me["in_zone"] or t >= zone["shrink_start"]
         elif weapon is not None and math.hypot(weapon[0] - x, weapon[1] - y) > 1.5:
             yaw = self._toward(me, weapon[0], weapon[1], False)
+        elif drop is not None:
+            yaw = self._drop_yaw(me, drop)
         elif config.THREAT_RETREAT and self.retreat and threats:
             yaw = self._flee(me, threats, zone, t)
             boost = threats[0]["_d"] < 120
@@ -463,6 +466,40 @@ class Bot:
             if best_key is None or key < best_key:
                 best_key, best = key, (px, py)
         return best
+
+    def _drop_commit(self, obs: dict, me: dict, mechs: list, t: float) -> dict | None:
+        """A supply drop we can reach by the time it lands, and then capture alone."""
+        x, y, z = me["pos"]
+        walk = max(me["stats"]["walk_speed"], 1.0)
+        best = None
+        best_key = None
+        for drop in obs["drops"]:
+            if drop.get("holder") not in (None, me["id"]):
+                continue
+            px, py = drop["pos"][0], drop["pos"][1]
+            if not self._safe_spot(px, py, obs["zone"], t) or self._on_roof(drop["pos"], z):
+                continue
+            ring = drop.get("radius", 8.0)
+            occupied = any(math.hypot(m["pos"][0] - px, m["pos"][1] - py) < ring for m in mechs)
+            if occupied and drop.get("holder") != me["id"]:
+                continue
+            d = math.hypot(px - x, py - y)
+            if d > 160 or drop.get("lands_in", 0) > d / walk + 8:
+                continue
+            key = (drop.get("lands_in", 0), d)
+            if best_key is None or key < best_key:
+                best_key, best = key, drop
+        return best
+
+    def _drop_yaw(self, me: dict, drop: dict) -> float:
+        """Walk to the ring, then circle inside it so the 4 s capture is not walked off."""
+        x, y, _ = me["pos"]
+        px, py = drop["pos"][0], drop["pos"][1]
+        ring = drop.get("radius", 8.0)
+        if math.hypot(px - x, py - y) > ring - 2:
+            return self._toward(me, px, py, False)
+        bearing = math.atan2(y - py, x - px)
+        return self._steer(x, y, bearing + math.pi / 2)
 
     def _loot(self, obs: dict, me: dict, npcs: list, t: float, healthy: bool):
         """(x, y, stop distance) of the most worthwhile thing nearby, or None."""
