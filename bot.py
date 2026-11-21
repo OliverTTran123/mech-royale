@@ -23,9 +23,11 @@ WANTED = ("laser", "lightning")  # a mortar is skipped: it invites laser cook-of
 EARLY_S = 90.0  # opening: detour for a weapon even with a mech nearby, and farm cubes
 FARM_CLEAR = 80.0  # opening: crates and drones come before a mech that is no closer than this
 SWARM_S = 5.0  # two drones shooting at me: stay clear of drones this long
-UPGRADES = [  # most wanted first: staying alive, then damage
-    "armor", "plating", "nanites", "gun_damage", "gun_rate", "servos", "laser_damage",
-    "lightning_efficiency", "gyros", "gun_mag", "laser_charge", "gun_velocity", "lightning_range",
+CUBE_M = 70.0  # walk to a cube this close at any health, even with a mech nearby
+LIGHTNING_CLOSE = 38.0  # holding lightning: walk at the target until it is inside the arc
+UPGRADES = [  # most wanted first: less reloading, then gun damage, then staying alive
+    "gun_mag", "gun_damage", "gun_rate", "armor", "plating", "nanites", "servos", "laser_damage",
+    "lightning_efficiency", "gyros", "laser_charge", "gun_velocity", "lightning_range",
     "lightning_chain", "reactor", "jets", "capacitor", "sensors", "laser_pierce",
 ]  # fmt: skip
 LOUD = {"gun", "laser", "laser_charge", "lightning", "mortar", "step", "boost", "jet"}
@@ -149,6 +151,7 @@ class Bot:
                 away = sorted((n for n in npcs if n["_d"] < reach), key=lambda n: n["_d"])
         loot = dodge = None
         weapon = self._early_weapon(obs, me, t) if config.LOOT and not urgent else None
+        cube = self._near_cube(obs, me, t) if config.LOOT and not urgent else None
         drop = self._drop_commit(obs, me, mechs, t) if config.LOOT and not urgent else None
         if config.LOOT and calm and not urgent:
             loot = self._loot(obs, me, npcs, t, crates_ok, drones_ok)
@@ -169,11 +172,19 @@ class Bot:
         elif away:
             yaw = self._flee(me, away, zone, t)
             boost = away[0]["_d"] < self.cfg["npc"]["aggro_range"]
+        elif cube is not None and math.hypot(cube[0] - x, cube[1] - y) > 1.5:
+            yaw = self._toward(me, cube[0], cube[1], False)
         elif config.THREAT_RETREAT and self.retreat and threats:
             yaw = self._flee(me, threats, zone, t)
             boost = threats[0]["_d"] < 120
         elif config.THREAT_RETREAT and focus is not None:
             yaw = self._strafe(me, focus, zone, t)
+        elif (
+            focus is not None
+            and focus["_d"] > LIGHTNING_CLOSE
+            and any(w and w["kind"] == "lightning" for w in me["weapons"])
+        ):  # the arc reaches 45 m and the bot otherwise fights from further out
+            yaw = self._toward(me, focus["pos"][0], focus["pos"][1], False)
         elif loot is not None:
             if math.hypot(loot[0] - x, loot[1] - y) > loot[2]:
                 yaw = self._toward(me, loot[0], loot[1], False)
@@ -469,6 +480,22 @@ class Bot:
         if t > zone["shrink_start"] - 25:
             return math.hypot(px - nc[0], py - nc[1]) < zone["next_radius"] - 3
         return True
+
+    def _near_cube(self, obs: dict, me: dict, t: float) -> tuple[float, float] | None:
+        """The nearest cube worth walking to (+4% damage and max HP), even if a mech is nearby."""
+        x, y, z = me["pos"]
+        best = None
+        best_d = 1e9
+        for cube in obs["cubes"]:
+            if cube["id"] in self.skip:
+                continue
+            px, py = cube["pos"][0], cube["pos"][1]
+            if not self._safe_spot(px, py, obs["zone"], t) or self._on_roof(cube["pos"], z):
+                continue
+            d = math.hypot(px - x, py - y)
+            if d <= CUBE_M and d < best_d:
+                best_d, best = d, (px, py)
+        return best
 
     def _early_weapon(self, obs: dict, me: dict, t: float) -> tuple[float, float] | None:
         """Lightning, else a laser, inside the current circle during the opening."""
