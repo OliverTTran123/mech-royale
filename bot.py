@@ -132,6 +132,7 @@ class Bot:
         healthy = frac >= 0.8
         loot = dodge = None
         weapon = self._early_weapon(obs, me, t) if config.LOOT and not urgent else None
+        heal = self._heal_cube(obs, me, t) if config.LOOT and not urgent and frac < 0.8 else None
         if config.LOOT and calm and not urgent:
             loot = self._loot(obs, me, npcs, t, healthy)
         if config.THREAT_RETREAT:
@@ -146,6 +147,8 @@ class Bot:
             boost = not me["in_zone"] or t >= zone["shrink_start"]
         elif weapon is not None and math.hypot(weapon[0] - x, weapon[1] - y) > 1.5:
             yaw = self._toward(me, weapon[0], weapon[1], False)
+        elif heal is not None and math.hypot(heal[0] - x, heal[1] - y) > 1.5:
+            yaw = self._toward(me, heal[0], heal[1], False)
         elif config.THREAT_RETREAT and self.retreat and threats:
             yaw = self._flee(me, threats, zone, t)
             boost = threats[0]["_d"] < 120
@@ -464,6 +467,22 @@ class Bot:
             key = (0 if kind == "lightning" else 1, d)
             if best_key is None or key < best_key:
                 best_key, best = key, (px, py)
+        return best
+
+    def _heal_cube(self, obs: dict, me: dict, t: float) -> tuple[float, float] | None:
+        """A cube while hurt: picking one up heals 4% of max HP, even if a mech is nearby."""
+        x, y, z = me["pos"]
+        best = None
+        best_d = 1e9
+        for cube in obs["cubes"]:
+            if cube["id"] in self.skip:
+                continue
+            px, py = cube["pos"][0], cube["pos"][1]
+            if not self._safe_spot(px, py, obs["zone"], t) or self._on_roof(cube["pos"], z):
+                continue
+            d = math.hypot(px - x, py - y)
+            if d <= 70 and d < best_d:
+                best_d, best = d, (px, py)
         return best
 
     def _loot(self, obs: dict, me: dict, npcs: list, t: float, healthy: bool):
