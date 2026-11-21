@@ -21,8 +21,8 @@ FIELD_CELLS_PER_TICK = 4000  # flow-field work per decision, about 2 ms
 ENGAGE = 170.0  # mechs closer than this are threats and targets
 WANTED = ("laser", "lightning")  # a mortar is skipped: it invites laser cook-off
 EARLY_S = 90.0  # opening: detour for a weapon even with a mech nearby
-UPGRADES = [  # most wanted first: staying alive, then damage
-    "armor", "plating", "nanites", "gun_damage", "gun_rate", "servos", "laser_damage",
+UPGRADES = [  # most wanted first: kill speed with the gun, then staying alive
+    "gun_damage", "gun_rate", "armor", "plating", "nanites", "servos", "laser_damage",
     "lightning_efficiency", "gyros", "gun_mag", "laser_charge", "gun_velocity", "lightning_range",
     "lightning_chain", "reactor", "jets", "capacitor", "sensors", "laser_pierce",
 ]  # fmt: skip
