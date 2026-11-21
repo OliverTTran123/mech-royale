@@ -6,11 +6,13 @@
 - targets: shoot the mech that is cheapest to kill, leading the shot.
 
 Legs and torso are independent, so movement and aim are decided separately each decision.
+Each rule has a flag in config.py; with a flag off, that part does what the kit's starter does.
 """
 
 import math
 import random
 
+import config
 import mechfight as mf
 from nav import Nav
 
@@ -50,10 +52,11 @@ class Bot:
             "crate": cfg["crates"]["radius"],
         }
         self.nav: Nav | None = None
-        try:
-            self.nav = Nav(hello["map"]["dir"])
-        except (OSError, ValueError, KeyError) as error:
-            mf.log(f"no map, steering blind: {error!r}")
+        if config.ZONE or config.THREAT_RETREAT or config.LOOT or config.TARGETING:
+            try:
+                self.nav = Nav(hello["map"]["dir"])
+            except (OSError, ValueError, KeyError) as error:
+                mf.log(f"no map, steering blind: {error!r}")
 
         self.attackers: dict[int, float] = {}  # mech id -> last time it damaged me
         self.hurt_t = self.npc_hurt_t = self.heard_t = self.last_threat_t = -99.0
@@ -75,12 +78,14 @@ class Bot:
 
     # ------------------------------------------------------------------ one decision
     def act(self, obs: mf.Observation) -> mf.Action:
+        if not (config.ZONE or config.THREAT_RETREAT or config.LOOT or config.TARGETING):
+            return self._starter(obs)
         me = obs["self"]
         t = obs["t"]
         x, y, z = me["pos"]
         zone = obs["zone"]
         nav = self.nav
-        if nav:
+        if nav and config.ZONE:
             nav.set_goal(zone["next_center"][0], zone["next_center"][1])
             nav.work(FIELD_CELLS_PER_TICK)
         self._events(obs["events"], t)
@@ -95,7 +100,7 @@ class Bot:
         )
         hp = me["hp"]
         frac = hp / me["max_hp"]
-        if threats:
+        if threats and config.THREAT_RETREAT:
             self.last_threat_t = t
             nearest_hp = threats[0].get("hp", self.full_hp)
             if len(threats) >= 2 or frac < 0.4 or hp < 0.6 * nearest_hp:
@@ -104,60 +109,90 @@ class Bot:
                 self.retreat = False
         elif t - self.last_threat_t > 3:
             self.retreat = False
-        target = min(threats, key=lambda m: self._kill_cost(m, t)) if threats else None
+        focus = None  # the threat to circle and, with TARGETING, to shoot
+        if threats and config.TARGETING:
+            focus = min(threats, key=lambda m: self._kill_cost(m, t))
+        elif threats:
+            focus = threats[0]
 
         # --- legs
         nc, nr = zone["next_center"], zone["next_radius"]
         safe_r = nr - min(20.0, 0.3 * nr) if nr > 0 else max(2.0, 0.4 * zone["radius"])
         d_out = math.hypot(x - nc[0], y - nc[1]) - safe_r
         walk = me["stats"]["walk_speed"]
-        urgent = d_out > 0 and (
-            not me["in_zone"] or t + d_out / walk * 1.3 + 8 >= zone["shrink_start"]
+        urgent = (
+            config.ZONE
+            and d_out > 0
+            and (not me["in_zone"] or t + d_out / walk * 1.3 + 8 >= zone["shrink_start"])
         )
         calm = not threats
         healthy = frac >= 0.8
-        loot = self._loot(obs, me, npcs, t, healthy) if calm and not urgent else None
-        dodge = self._shell_dodge(obs["projectiles"], x, y, z)
+        loot = dodge = None
+        if config.LOOT and calm and not urgent:
+            loot = self._loot(obs, me, npcs, t, healthy)
+        if config.THREAT_RETREAT:
+            dodge = self._shell_dodge(obs["projectiles"], x, y, z)
         yaw: float | None = None
         boost = False
+        starter_legs = False
         if dodge is not None:
             yaw, boost = dodge, True
         elif urgent:
             yaw = self._toward(me, nc[0], nc[1], True)
             boost = not me["in_zone"] or t >= zone["shrink_start"]
-        elif self.retreat and threats:
+        elif config.THREAT_RETREAT and self.retreat and threats:
             yaw = self._flee(me, threats, zone, t)
             boost = threats[0]["_d"] < 120
-        elif target is not None:
-            yaw = self._strafe(me, target, zone, t)
+        elif config.THREAT_RETREAT and focus is not None:
+            yaw = self._strafe(me, focus, zone, t)
         elif loot is not None:
             if math.hypot(loot[0] - x, loot[1] - y) > loot[2]:
                 yaw = self._toward(me, loot[0], loot[1], False)
+        elif not config.ZONE:
+            starter_legs = True
+            yaw = math.atan2(nc[1] - y, nc[0] - x)
         elif d_out > 0:
             yaw = self._toward(me, nc[0], nc[1], True)
 
-        # --- pushing against something: jump and jet over it
-        speed = math.hypot(me["vel"][0], me["vel"][1])
-        self.slow = self.slow + 1 if self.was_moving and speed < 2.0 else 0
-        self.was_moving = yaw is not None
-        if self.jetting:
-            cleared = speed > 4.0 and t - self.jet_start > 0.5
-            if cleared or me["energy"] < 4 or t - self.jet_start > 7 or yaw is None:
-                self.jetting = False
-        elif self.slow >= 5 and me["energy"] >= 40 and yaw is not None:
-            self.jetting, self.jet_start, self.slow = True, t, 0
-            self.side = -self.side
-        jump = self.jetting and me["grounded"]
-        if self.jetting:
-            boost = True
+        if config.ZONE:  # pushing against something: jump and jet over it
+            speed = math.hypot(me["vel"][0], me["vel"][1])
+            self.slow = self.slow + 1 if self.was_moving and speed < 2.0 else 0
+            self.was_moving = yaw is not None
+            if self.jetting:
+                cleared = speed > 4.0 and t - self.jet_start > 0.5
+                if cleared or me["energy"] < 4 or t - self.jet_start > 7 or yaw is None:
+                    self.jetting = False
+            elif self.slow >= 5 and me["energy"] >= 40 and yaw is not None:
+                self.jetting, self.jet_start, self.slow = True, t, 0
+                self.side = -self.side
+            jump = self.jetting and me["grounded"]
+            if self.jetting:
+                boost = True
+        else:
+            jump = obs["tick"] % 40 == 0
         if boost and me["energy"] < 2:
             boost = False
+        if starter_legs:
+            boost = not me["in_zone"]
 
         # --- torso
-        farm = None if target or not calm else self._farm_target(obs, me, npcs, t, healthy)
-        aim, fire, firing = self._gunnery(me, target, farm, t)
-        if aim is None:
-            aim = [self._look(obs["sounds"], me, t, yaw), 0.0]
+        firing = False
+        if config.TARGETING:
+            farm = None
+            if config.LOOT and calm and focus is None:
+                farm = self._farm_target(obs, me, npcs, t, healthy)
+            aim, fire, firing = self._gunnery(me, focus, farm, t)
+            if aim is None:
+                aim = [self._look(obs["sounds"], me, t, yaw), 0.0]
+        elif mechs:
+            tx, ty, tz = min(mechs, key=lambda m: math.dist(m["pos"], me["pos"]))["pos"]
+            flat = math.hypot(tx - x, ty - y)
+            aim, fire = [math.atan2(ty - y, tx - x), math.atan2(tz - z - 2.5, flat)], [True, True]
+        else:
+            aim, fire = [math.atan2(nc[1] - y, nc[0] - x), 0.0], [False, False]
+            farm = self._farm_target(obs, me, npcs, t, healthy) if config.LOOT else None
+            if farm is not None:
+                aim, fire, firing = self._gunnery(me, None, farm, t)
 
         move = [0, 0] if yaw is None else [round(math.cos(yaw), 3), round(math.sin(yaw), 3)]
         action: mf.Action = {
@@ -168,16 +203,56 @@ class Bot:
             "fire": fire,
         }
         gun = next((w for w in me["weapons"] if w and w["kind"] == "gun"), None)
-        if gun and not gun["reload"]:
-            idle = target is None and not firing and gun["ammo"] < gun["stats"]["mag"]
+        if config.TARGETING and gun and not gun["reload"]:
+            idle = focus is None and not firing and gun["ammo"] < gun["stats"]["mag"]
             if gun["ammo"] == 0 or idle:  # empty, or topping up between fights
                 action["reload"] = True
         if obs["offer"]:
-            action["pick"] = self._pick(obs["offer"])
-        take = self._take(obs["pickups"], me)
+            action["pick"] = self._pick(obs["offer"]) if config.LOOT else 0
+        take = self._take(obs["pickups"], me) if config.LOOT else self._starter_take(obs, me)
         if take is not None:
             action["take"] = take
         return action
+
+    def _starter(self, obs: mf.Observation) -> mf.Action:
+        """The kit's example bot, verbatim in effect: straight at the next center, hop every 2 s,
+        shoot the nearest mech with no lead, take the first weapon in reach."""
+        me = obs["self"]
+        x, y, z = me["pos"]
+        goal = obs["zone"]["next_center"]
+        act: mf.Action = {"tick": obs["tick"]}
+        if obs["offer"]:
+            act["pick"] = 0
+        near = [p for p in obs["pickups"] if math.dist(p["pos"][:2], (x, y)) < self.reach]
+        if me["weapons"][1] is None and near and near[0]["kind"] != "gun":
+            act["take"] = near[0]["id"]
+        enemies = sorted(
+            (m for m in obs["mechs"] if m["kind"] == "mech"),
+            key=lambda m: math.dist(m["pos"], me["pos"]),
+        )
+        yaw = math.atan2(goal[1] - y, goal[0] - x)
+        act["move"] = [math.cos(yaw), math.sin(yaw)]
+        act["aim"] = [yaw, 0.0]
+        act["boost"] = not me["in_zone"]
+        act["jump"] = obs["tick"] % 40 == 0
+        if enemies:
+            tx, ty, tz = enemies[0]["pos"]
+            act["aim"] = [
+                math.atan2(ty - y, tx - x),
+                math.atan2(tz - z - 2.5, math.dist((tx, ty), (x, y))),
+            ]
+            act["fire"] = [True, True]
+            mf.draw.line([x, y, z + 7], [tx, ty, tz + 4.5], "#ff5040")
+        mf.draw.point([goal[0], goal[1], z], "#40c0ff", 6)
+        mf.draw.label(f"hp {me['hp']:.0f} · {len(enemies)} in sight")
+        return act
+
+    def _starter_take(self, obs: dict, me: dict) -> int | None:
+        """The starter's rule: with slot 1 empty, take the first weapon in reach unless a gun."""
+        near = [p for p in obs["pickups"] if math.dist(p["pos"][:2], me["pos"][:2]) < self.reach]
+        if me["weapons"][1] is None and near and near[0]["kind"] != "gun":
+            return near[0]["id"]
+        return None
 
     # ------------------------------------------------------------------ bookkeeping
     def _events(self, events: list, t: float) -> None:
