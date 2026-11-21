@@ -103,7 +103,7 @@ class Bot:
         if threats and config.THREAT_RETREAT:
             self.last_threat_t = t
             nearest_hp = threats[0].get("hp", self.full_hp)
-            if len(threats) >= 2 or frac < 0.4 or hp < 0.6 * nearest_hp:
+            if len(threats) >= 2 or (len(threats) == 1 and hp <= nearest_hp):
                 self.retreat = True
             elif frac >= 0.7 and hp >= 0.8 * nearest_hp:
                 self.retreat = False
