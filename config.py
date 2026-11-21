@@ -9,7 +9,7 @@ ZONE = True
 
 # Legs around enemies. On: back off behind cover when outnumbered or losing, circle a single enemy
 # at range, run out from under mortar shells. Off (starter): enemies never change where it walks.
-THREAT_RETREAT = True
+THREAT_RETREAT = False
 
 # Loot. On: walk to cubes, a laser or lightning and supply drops when no mech is near, shoot crates
 # and drones for cubes when healthy, never take a mortar, rank upgrades.
