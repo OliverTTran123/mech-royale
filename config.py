@@ -14,7 +14,7 @@ THREAT_RETREAT = True
 # Loot. On: walk to cubes, a laser or lightning and supply drops when no mech is near, shoot crates
 # and drones for cubes when healthy, never take a mortar, rank upgrades.
 # Off (starter): take the first non-gun weapon in reach, always pick upgrade 0, never detour.
-LOOT = True
+LOOT = False
 
 # Torso. On: aim at the mech that is cheapest to kill, lead the shot, fire only when aligned, charge
 # and release the laser, reload between fights, look around when nothing is in sight.
