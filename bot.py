@@ -89,7 +89,14 @@ class Bot:
     # ------------------------------------------------------------------ one decision
     def act(self, obs: mf.Observation) -> mf.Action:
         if config.EVADE:
-            return self._act_evade(obs)
+            try:
+                return self._act_evade(obs)
+            except Exception as error:
+                mf.log(f"evade failed; keep moving: {error!r}")
+                return self._keep_moving(obs)
+        return self._keep_moving(obs)
+
+    def _keep_moving(self, obs: mf.Observation) -> mf.Action:
         if not (config.ZONE or config.THREAT_RETREAT or config.LOOT or config.TARGETING):
             return self._starter(obs)
         me = obs["self"]
@@ -239,8 +246,6 @@ class Bot:
         known = self._known_points(x, y)
         nearest = min((math.hypot(ex - x, ey - y) for ex, ey in known), default=1e9)
         walk = me["stats"]["walk_speed"]
-        cx, cy, safe_r = self._margin(zone)
-        d_out = math.hypot(x - cx, y - cy) - safe_r
 
         mechs = []
         for m in obs["mechs"]:
@@ -251,26 +256,36 @@ class Bot:
         yaw: float | None = None
         length = 1.0
         boost = False
-        dodge = self._shell_dodge(obs["projectiles"], x, y, z) if config.THREAT_RETREAT else None
-        if dodge is not None:
-            yaw, boost = dodge, True
-        elif d_out > 0:
-            yaw = self._evade_yaw(me, zone, known, safe_r)
-            boost = not me["in_zone"]
+        if self._outside_current(me, zone):
+            # Zone damage ignores armor. Threats, cover, and shells never outweigh it.
+            center = zone.get("center") or [x, y]
+            yaw = self._closer_heading(x, y, center[0], center[1])
+            boost = True
         else:
-            looting = False
-            if config.LOOT and nearest > LOOT_M:
-                loot = self._loot(obs, me, [], t, False)  # no crates: those need a shot
-                if loot is not None and math.hypot(loot[0] - x, loot[1] - y) > loot[2]:
-                    yaw = self._toward(me, loot[0], loot[1], False)
-                    looting = True
-            if not looting and known:
-                yaw = self._evade_yaw(me, zone, known, safe_r)
-            elif not looting and self.nav and self.nav.by_cover(x, y):
-                length = 0.0  # behind a building and nobody known: stand and regenerate
-            elif not looting:
-                yaw = self._orbit(me, zone)  # open ground: shuffle in place, quietly
-                length = REST_SPEED / walk
+            cx, cy, safe_r = self._margin(zone)
+            d_out = math.hypot(x - cx, y - cy) - safe_r
+            dodge = (
+                self._shell_dodge(obs["projectiles"], x, y, z) if config.THREAT_RETREAT else None
+            )
+            if dodge is not None:
+                yaw, boost = dodge, True
+            elif d_out > 0:
+                yaw = self._inward_yaw(me, zone)
+                boost = False
+            else:
+                looting = False
+                if config.LOOT and nearest > LOOT_M:
+                    loot = self._loot(obs, me, [], t, False)  # no crates: those need a shot
+                    if loot is not None and math.hypot(loot[0] - x, loot[1] - y) > loot[2]:
+                        yaw = self._toward(me, loot[0], loot[1], False)
+                        looting = True
+                if not looting and known:
+                    yaw = self._evade_yaw(me, zone, known, safe_r)
+                elif not looting and self.nav and self.nav.by_cover(x, y):
+                    length = 0.0  # behind a building and nobody known: stand and regenerate
+                elif not looting:
+                    yaw = self._orbit(me, zone)  # open ground: shuffle in place, quietly
+                    length = REST_SPEED / walk
 
         if config.ZONE and yaw is not None:
             speed = math.hypot(me["vel"][0], me["vel"][1])
@@ -356,6 +371,44 @@ class Bot:
         center, radius = zone["next_center"], zone["next_radius"]
         margin = radius - min(20.0, 0.3 * radius) if radius > 0 else max(2.0, 0.4 * zone["radius"])
         return center[0], center[1], margin
+
+    def _outside_current(self, me: dict, zone: dict) -> bool:
+        if not me.get("in_zone", True):
+            return True
+        center, radius = zone.get("center"), zone.get("radius")
+        if not center or radius is None:
+            return False
+        x, y = me["pos"][0], me["pos"][1]
+        return math.hypot(x - center[0], y - center[1]) > float(radius)
+
+    def _closer_heading(self, x: float, y: float, gx: float, gy: float) -> float:
+        """Aim at (gx, gy). Bend for a wall only when the bend still gets closer."""
+        direct = math.atan2(gy - y, gx - x)
+        steered = self._steer(x, y, direct)
+        now = math.hypot(x - gx, y - gy)
+        sx, sy = x + 12 * math.cos(steered), y + 12 * math.sin(steered)
+        if math.hypot(sx - gx, sy - gy) < now - 0.25:
+            return steered
+        return direct
+
+    def _inward_yaw(self, me: dict, zone: dict) -> float:
+        """Outside the next margin, the step that gets closest to the next center.
+
+        Cover and threat scores are ignored. Every sample can still be outside the
+        margin; the one that reduces the distance wins. A wall bend that does not
+        get closer loses to walking straight at the center.
+        """
+        x, y, _ = me["pos"]
+        cx, cy, _ = self._margin(zone)
+        now = math.hypot(x - cx, y - cy)
+        best_yaw, best_dist = self._closer_heading(x, y, cx, cy), now
+        for k in range(16):
+            yaw = self._steer(x, y, k * TWO_PI / 16)
+            px, py = x + 12 * math.cos(yaw), y + 12 * math.sin(yaw)
+            dist = math.hypot(px - cx, py - cy)
+            if dist < best_dist:
+                best_yaw, best_dist = yaw, dist
+        return best_yaw
 
     def _evade_yaw(
         self, me: dict, zone: dict, known: list[tuple[float, float]], safe_r: float
