@@ -28,7 +28,6 @@ UPGRADES = [  # most wanted first: staying alive, then damage
 ]  # fmt: skip
 LOUD = {"gun", "laser", "laser_charge", "lightning", "mortar", "step", "boost", "jet"}
 MEMORY_S = 5.0  # keep a mech after it leaves the observation
-SHOOT_M = 15.0  # fire only inside this range, and only if cover is more than a second away
 LOOT_M = 60.0  # do not detour for loot with a mech this close
 PHANTOM_M = 50.0  # where to place a shooter we know only by bearing
 STEP_SPEED = 5.0  # above this, footsteps give the position away
@@ -247,12 +246,6 @@ class Bot:
         nearest = min((math.hypot(ex - x, ey - y) for ex, ey in known), default=1e9)
         walk = me["stats"]["walk_speed"]
 
-        mechs = []
-        for m in obs["mechs"]:
-            if m["kind"] == "mech":
-                m["_d"] = math.hypot(m["pos"][0] - x, m["pos"][1] - y)
-                mechs.append(m)
-
         yaw: float | None = None
         length = 1.0
         boost = False
@@ -308,13 +301,7 @@ class Bot:
             boost = False
 
         aim, fire = [self._look(obs["sounds"], me, t, yaw), 0.0], [False, False]
-        threat = self._point_blank(me, mechs, zone, walk)
         gun = next((w for w in me["weapons"] if w and w["kind"] == "gun"), None)
-        if threat is not None and gun and not gun["reload"]:
-            lead = self._solution(me, threat, gun["stats"]["speed"])
-            aim = [lead[0], lead[1]]
-            if gun["ammo"] > 0 and self._aligned(me, lead, threat):
-                fire[0] = True
 
         if length == 0.0 or yaw is None:
             move = [0.0, 0.0]
@@ -436,49 +423,6 @@ class Bot:
             if score > best_score:
                 best_yaw, best_score = yaw, score
         return best_yaw
-
-    def _point_blank(self, me: dict, mechs: list, zone: dict, walk: float) -> dict | None:
-        """Closest mech inside SHOOT_M that one second of walking cannot hide from."""
-        x, y, _ = me["pos"]
-        nav = self.nav
-        stuck = []
-        for mech in mechs:
-            if mech["_d"] > SHOOT_M:
-                continue
-            ex, ey = mech["pos"][0], mech["pos"][1]
-            if nav and nav.hidden(x, y, ex, ey):
-                continue
-            if not self._can_hide(x, y, ex, ey, zone, walk):
-                stuck.append(mech)
-        if not stuck:
-            return None
-        return min(stuck, key=lambda m: m["_d"])
-
-    def _can_hide(self, x: float, y: float, ex: float, ey: float, zone: dict, walk: float) -> bool:
-        nav = self.nav
-        if nav is None:
-            return False
-        cx, cy, safe_r = self._margin(zone)
-        reach = walk * 1.0
-        for k in range(12):
-            yaw = self._steer(x, y, k * TWO_PI / 12)
-            px, py = x + reach * math.cos(yaw), y + reach * math.sin(yaw)
-            if math.hypot(px - cx, py - cy) > safe_r:
-                continue
-            if nav.hidden(px, py, ex, ey):
-                return True
-        return False
-
-    def _aligned(self, me: dict, sol: tuple[float, float, float], target: dict) -> bool:
-        grow = 1 + self.cfg["cubes"]["size_per_cube"] * target.get("cubes", 0)
-        half_w = self.half_width[target["kind"]] * grow
-        half_h = self.half_height[target["kind"]] * grow
-        flat = max(sol[2], 1.0)
-        now_yaw, now_pitch = me["aim"]
-        return (
-            abs(wrap(sol[0] - now_yaw)) < math.atan2(half_w * 0.9, flat) + 0.05
-            and abs(sol[1] - now_pitch) < math.atan2(half_h * 0.9, flat) + 0.05
-        )
 
     def _starter(self, obs: mf.Observation) -> mf.Action:
         """The kit's example bot, verbatim in effect: straight at the next center, hop every 2 s,

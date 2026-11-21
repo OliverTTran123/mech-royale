@@ -23,8 +23,7 @@ LOOT = True
 # Off (starter): aim straight at the nearest mech and hold both triggers; else face the next center.
 TARGETING = True
 
-# Survival pivot. On: never start a fight. Shoot only a mech inside 15 m that we cannot
-# break sight of within a second. Run to maximize distance from everything known (seen,
+# Survival pivot. On: never fire. Run to maximize distance from everything known (seen,
 # remembered 5 s, or a bearing from a shooter we never saw), behind buildings, inside the
 # next circle. Rest on cover when nothing is known. Loot only with no mech inside 60 m.
 # Off: the rules above, including orbiting instead of standing still.
