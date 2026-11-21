@@ -26,6 +26,7 @@ UPGRADES = [  # most wanted first: staying alive, then damage
     "lightning_chain", "reactor", "jets", "capacitor", "sensors", "laser_pierce",
 ]  # fmt: skip
 LOUD = {"gun", "laser", "laser_charge", "lightning", "mortar", "step", "boost", "jet"}
+UNSEEN_FLEE_S = 3.0  # keep running from a shooter we cannot see
 
 
 def wrap(angle: float) -> float:
@@ -61,6 +62,8 @@ class Bot:
         self.attackers: dict[int, float] = {}  # mech id -> last time it damaged me
         self.hurt_t = self.npc_hurt_t = self.heard_t = self.last_threat_t = -99.0
         self.hurt_bearing = self.heard_bearing = 0.0
+        self.unseen_until = -99.0
+        self.unseen_bearing = 0.0
         self.laser_off_until = 0.0
         self.retreat = False
         self.flee_yaw: float | None = None
@@ -110,6 +113,16 @@ class Bot:
                 self.retreat = False
         elif t - self.last_threat_t > 3:
             self.retreat = False
+        if config.THREAT_RETREAT:
+            seen = {float(m["id"]) for m in obs["mechs"]}
+            for event in obs["events"]:
+                attacker = event.get("by") if event.get("type") == "damaged" else None
+                bearing = event.get("bearing")
+                if attacker is not None and bearing is not None and float(attacker) not in seen:
+                    self.unseen_bearing = bearing
+                    self.unseen_until = t + UNSEEN_FLEE_S
+            if t < self.unseen_until:
+                self.retreat = True
         focus = None  # the threat to circle and, with TARGETING, to shoot
         if threats and config.TARGETING:
             focus = min(threats, key=lambda m: self._kill_cost(m, t))
@@ -138,6 +151,8 @@ class Bot:
         starter_legs = False
         if dodge is not None:
             yaw, boost = dodge, True
+        elif config.THREAT_RETREAT and t < self.unseen_until:
+            yaw = self._flee_unseen(me, zone)
         elif urgent:
             yaw = self._toward(me, nc[0], nc[1], True)
             boost = not me["in_zone"] or t >= zone["shrink_start"]
@@ -346,6 +361,30 @@ class Bot:
                 self.orbit_sign = sign
                 return yaw
         return self._steer(x, y, math.atan2(-uy, -ux))
+
+    def _flee_unseen(self, me: dict, zone: dict) -> float:
+        """Opposite the bearing the hit came from, behind a building when one is close."""
+        x, y, _ = me["pos"]
+        away = self.unseen_bearing + math.pi
+        src = (x + 40 * math.cos(self.unseen_bearing), y + 40 * math.sin(self.unseen_bearing))
+        nav = self.nav
+        cx, cy = zone["center"]
+        limit = zone["radius"] - 12
+        best, best_score = None, -1e9
+        for k in range(-4, 5):
+            yaw = away + k * 0.35
+            steered = self._steer(x, y, yaw)
+            px, py = x + 16 * math.cos(steered), y + 16 * math.sin(steered)
+            if math.hypot(px - cx, py - cy) > limit:
+                continue
+            score = 4 - abs(k)
+            if nav and nav.hidden(px, py, src[0], src[1]):
+                score += 5  # a building between us and the shot
+            if score > best_score:
+                best, best_score = steered, score
+        if best is None:
+            best = math.atan2(cy - y, cx - x)
+        return best
 
     def _strafe(self, me: dict, target: dict, zone: dict, t: float) -> float:
         """Circle the target at a preferred range, switching direction at random to spoil leads."""
