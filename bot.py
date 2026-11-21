@@ -20,6 +20,7 @@ TWO_PI = 2 * math.pi
 FIELD_CELLS_PER_TICK = 4000  # flow-field work per decision, about 2 ms
 ENGAGE = 170.0  # mechs closer than this are threats and targets
 WANTED = ("laser", "lightning")  # a mortar is skipped: it invites laser cook-off
+EARLY_S = 90.0  # opening: detour for a weapon even with a mech nearby
 UPGRADES = [  # most wanted first: staying alive, then damage
     "armor", "plating", "nanites", "gun_damage", "gun_rate", "servos", "laser_damage",
     "lightning_efficiency", "gyros", "gun_mag", "laser_charge", "gun_velocity", "lightning_range",
@@ -129,6 +130,7 @@ class Bot:
         calm = not threats
         healthy = frac >= 0.8
         loot = dodge = None
+        weapon = self._early_weapon(obs, me, t) if config.LOOT and not urgent else None
         if config.LOOT and calm and not urgent:
             loot = self._loot(obs, me, npcs, t, healthy)
         if config.THREAT_RETREAT:
@@ -141,6 +143,8 @@ class Bot:
         elif urgent:
             yaw = self._toward(me, nc[0], nc[1], True)
             boost = not me["in_zone"] or t >= zone["shrink_start"]
+        elif weapon is not None and math.hypot(weapon[0] - x, weapon[1] - y) > 1.5:
+            yaw = self._toward(me, weapon[0], weapon[1], False)
         elif config.THREAT_RETREAT and self.retreat and threats:
             yaw = self._flee(me, threats, zone, t)
             boost = threats[0]["_d"] < 120
@@ -433,6 +437,32 @@ class Bot:
         if t > zone["shrink_start"] - 25:
             return math.hypot(px - nc[0], py - nc[1]) < zone["next_radius"] - 3
         return True
+
+    def _early_weapon(self, obs: dict, me: dict, t: float) -> tuple[float, float] | None:
+        """Lightning, else a laser, inside the current circle during the opening."""
+        if t >= EARLY_S or None not in me["weapons"]:
+            return None
+        held = {w["kind"] for w in me["weapons"] if w}
+        x, y, z = me["pos"]
+        center, radius = obs["zone"]["center"], obs["zone"]["radius"]
+        best = None
+        best_key = None
+        for pickup in obs["pickups"]:
+            kind = pickup["kind"]
+            if kind not in WANTED or kind in held or pickup["id"] in self.skip:
+                continue
+            px, py = pickup["pos"][0], pickup["pos"][1]
+            if math.hypot(px - center[0], py - center[1]) >= radius:
+                continue
+            if self._on_roof(pickup["pos"], z):
+                continue
+            d = math.hypot(px - x, py - y)
+            if d > 90:
+                continue
+            key = (0 if kind == "lightning" else 1, d)
+            if best_key is None or key < best_key:
+                best_key, best = key, (px, py)
+        return best
 
     def _loot(self, obs: dict, me: dict, npcs: list, t: float, healthy: bool):
         """(x, y, stop distance) of the most worthwhile thing nearby, or None."""
