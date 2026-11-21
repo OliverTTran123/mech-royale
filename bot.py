@@ -4,7 +4,7 @@
 - threats: back off behind cover when outnumbered or losing, and let health regenerate;
 - loot: collect cubes, a laser or lightning, and supply drops while nobody is near;
 - targets: shoot the mech that is cheapest to kill, leading the shot.
-- evade, when that flag is on: do not start a fight; run for distance and cover.
+- evade, when that flag is on: run for distance and cover, and shoot with the keep-moving rules.
 
 Legs and torso are independent, so movement and aim are decided separately each decision.
 Each rule has a flag in config.py; with a flag off, that part does what the kit's starter does.
@@ -28,7 +28,6 @@ UPGRADES = [  # most wanted first: staying alive, then damage
 ]  # fmt: skip
 LOUD = {"gun", "laser", "laser_charge", "lightning", "mortar", "step", "boost", "jet"}
 MEMORY_S = 5.0  # keep a mech after it leaves the observation
-SHOOT_M = 15.0  # fire only inside this range, and only if cover is more than a second away
 LOOT_M = 60.0  # do not detour for loot with a mech this close
 PHANTOM_M = 50.0  # where to place a shooter we know only by bearing
 STEP_SPEED = 5.0  # above this, footsteps give the position away
@@ -247,11 +246,10 @@ class Bot:
         nearest = min((math.hypot(ex - x, ey - y) for ex, ey in known), default=1e9)
         walk = me["stats"]["walk_speed"]
 
-        mechs = []
+        mechs, npcs = [], []
         for m in obs["mechs"]:
-            if m["kind"] == "mech":
-                m["_d"] = math.hypot(m["pos"][0] - x, m["pos"][1] - y)
-                mechs.append(m)
+            m["_d"] = math.hypot(m["pos"][0] - x, m["pos"][1] - y)
+            (mechs if m["kind"] == "mech" else npcs).append(m)
 
         yaw: float | None = None
         length = 1.0
@@ -307,14 +305,46 @@ class Bot:
         if boost and me["energy"] < 2:
             boost = False
 
-        aim, fire = [self._look(obs["sounds"], me, t, yaw), 0.0], [False, False]
-        threat = self._point_blank(me, mechs, zone, walk)
-        gun = next((w for w in me["weapons"] if w and w["kind"] == "gun"), None)
-        if threat is not None and gun and not gun["reload"]:
-            lead = self._solution(me, threat, gun["stats"]["speed"])
-            aim = [lead[0], lead[1]]
-            if gun["ammo"] > 0 and self._aligned(me, lead, threat):
-                fire[0] = True
+        threats = sorted(
+            (m for m in mechs if m["_d"] < ENGAGE or self.attackers.get(m["id"], -99) > t - 4),
+            key=lambda m: m["_d"],
+        )
+        hp = me["hp"]
+        frac = hp / me["max_hp"]
+        if threats and config.THREAT_RETREAT:
+            self.last_threat_t = t
+            nearest_hp = threats[0].get("hp", self.full_hp)
+            if len(threats) >= 2 or frac < 0.4 or hp < 0.6 * nearest_hp:
+                self.retreat = True
+            elif frac >= 0.7 and hp >= 0.8 * nearest_hp:
+                self.retreat = False
+        elif t - self.last_threat_t > 3:
+            self.retreat = False
+        focus = None  # same target keep-moving would shoot
+        if threats and config.TARGETING:
+            focus = min(threats, key=lambda m: self._kill_cost(m, t))
+        elif threats:
+            focus = threats[0]
+        calm, healthy = not threats, frac >= 0.8
+        firing = False
+        if config.TARGETING:
+            farm = None
+            if config.LOOT and calm and focus is None:
+                farm = self._farm_target(obs, me, npcs, t, healthy)
+            aim, fire, firing = self._gunnery(me, focus, farm, t)
+            if aim is None:
+                aim = [self._look(obs["sounds"], me, t, yaw), 0.0]
+        elif mechs:
+            tx, ty, tz = min(mechs, key=lambda m: math.dist(m["pos"], me["pos"]))["pos"]
+            flat = math.hypot(tx - x, ty - y)
+            aim = [math.atan2(ty - y, tx - x), math.atan2(tz - z - 2.5, flat)]
+            fire = [True, True]
+        else:
+            nc = zone["next_center"]
+            aim, fire = [math.atan2(nc[1] - y, nc[0] - x), 0.0], [False, False]
+            farm = self._farm_target(obs, me, npcs, t, healthy) if config.LOOT else None
+            if farm is not None:
+                aim, fire, firing = self._gunnery(me, None, farm, t)
 
         if length == 0.0 or yaw is None:
             move = [0.0, 0.0]
@@ -327,9 +357,11 @@ class Bot:
             "aim": [round(wrap(aim[0]), 4), round(aim[1], 4)],
             "fire": fire,
         }
-        topping_up = gun and not gun["reload"] and gun["ammo"] < gun["stats"]["mag"]
-        if config.TARGETING and topping_up and nearest > LOOT_M and not fire[0]:
-            action["reload"] = True
+        gun = next((w for w in me["weapons"] if w and w["kind"] == "gun"), None)
+        if config.TARGETING and gun and not gun["reload"]:
+            idle = focus is None and not firing and gun["ammo"] < gun["stats"]["mag"]
+            if gun["ammo"] == 0 or idle:  # empty, or topping up between fights
+                action["reload"] = True
         if obs["offer"]:
             action["pick"] = self._pick(obs["offer"]) if config.LOOT else 0
         if config.LOOT and nearest > LOOT_M:
@@ -436,49 +468,6 @@ class Bot:
             if score > best_score:
                 best_yaw, best_score = yaw, score
         return best_yaw
-
-    def _point_blank(self, me: dict, mechs: list, zone: dict, walk: float) -> dict | None:
-        """Closest mech inside SHOOT_M that one second of walking cannot hide from."""
-        x, y, _ = me["pos"]
-        nav = self.nav
-        stuck = []
-        for mech in mechs:
-            if mech["_d"] > SHOOT_M:
-                continue
-            ex, ey = mech["pos"][0], mech["pos"][1]
-            if nav and nav.hidden(x, y, ex, ey):
-                continue
-            if not self._can_hide(x, y, ex, ey, zone, walk):
-                stuck.append(mech)
-        if not stuck:
-            return None
-        return min(stuck, key=lambda m: m["_d"])
-
-    def _can_hide(self, x: float, y: float, ex: float, ey: float, zone: dict, walk: float) -> bool:
-        nav = self.nav
-        if nav is None:
-            return False
-        cx, cy, safe_r = self._margin(zone)
-        reach = walk * 1.0
-        for k in range(12):
-            yaw = self._steer(x, y, k * TWO_PI / 12)
-            px, py = x + reach * math.cos(yaw), y + reach * math.sin(yaw)
-            if math.hypot(px - cx, py - cy) > safe_r:
-                continue
-            if nav.hidden(px, py, ex, ey):
-                return True
-        return False
-
-    def _aligned(self, me: dict, sol: tuple[float, float, float], target: dict) -> bool:
-        grow = 1 + self.cfg["cubes"]["size_per_cube"] * target.get("cubes", 0)
-        half_w = self.half_width[target["kind"]] * grow
-        half_h = self.half_height[target["kind"]] * grow
-        flat = max(sol[2], 1.0)
-        now_yaw, now_pitch = me["aim"]
-        return (
-            abs(wrap(sol[0] - now_yaw)) < math.atan2(half_w * 0.9, flat) + 0.05
-            and abs(sol[1] - now_pitch) < math.atan2(half_h * 0.9, flat) + 0.05
-        )
 
     def _starter(self, obs: mf.Observation) -> mf.Action:
         """The kit's example bot, verbatim in effect: straight at the next center, hop every 2 s,
