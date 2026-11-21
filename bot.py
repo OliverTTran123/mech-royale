@@ -282,7 +282,7 @@ class Bot:
                 if not looting and known:
                     yaw = self._evade_yaw(me, zone, known, safe_r)
                 elif not looting and self.nav and self.nav.by_cover(x, y):
-                    length = 0.0  # behind a building and nobody known: stand and regenerate
+                    yaw = self._orbit(me, zone)  # a stopped mech is the squad's target
                 elif not looting:
                     yaw = self._orbit(me, zone)  # open ground: shuffle in place, quietly
                     length = REST_SPEED / walk
