@@ -19,6 +19,7 @@ from nav import Nav
 TWO_PI = 2 * math.pi
 FIELD_CELLS_PER_TICK = 4000  # flow-field work per decision, about 2 ms
 ENGAGE = 170.0  # mechs closer than this are threats and targets
+LASER_CLOSE = 40.0  # inside this, the gun fires; a laser holds for a full beam past it
 WANTED = ("laser", "lightning")  # a mortar is skipped: it invites laser cook-off
 EARLY_S = 90.0  # opening: detour for a weapon even with a mech nearby, and farm cubes
 FARM_CLEAR = 80.0  # opening: crates and drones come before a mech that is no closer than this
@@ -230,7 +231,8 @@ class Bot:
             if config.LOOT and calm and (focus is None or farming):
                 farm = self._farm_target(obs, me, npcs, t, crates_ok, drones_ok)
             target = None if farming and farm is not None else focus
-            aim, fire, firing = self._gunnery(me, target, farm, t)
+            laser_at = self._laser_mark(me, mechs)
+            aim, fire, firing = self._gunnery(me, target, farm, t, laser_at)
             if aim is None:
                 aim = [self._look(obs["sounds"], me, t, yaw), 0.0]
         elif mechs:
@@ -263,6 +265,10 @@ class Bot:
         take = self._take(obs["pickups"], me) if config.LOOT else self._starter_take(obs, me)
         if take is not None:
             action["take"] = take
+        elif config.LOOT:
+            trade = self._trade_for_laser(obs["pickups"], me, mechs)
+            if trade is not None:
+                action["take"], action["drop"] = trade
         return action
 
     def _starter(self, obs: mf.Observation) -> mf.Action:
@@ -329,17 +335,36 @@ class Bot:
         choices = offer["choices"]
         return min(range(len(choices)), key=lambda i: rank(choices[i]))
 
-    def _take(self, pickups: list, me: dict) -> int | None:
-        if None not in me["weapons"]:
-            return None
+    def _in_reach(self, pickups: list, me: dict, kinds: tuple) -> dict | None:
+        """The pickup of one of `kinds` that can be taken from here, a laser before the rest."""
         x, y, z = me["pos"]
-        held = {w["kind"] for w in me["weapons"] if w}
+        best = None
         for p in pickups:
             px, py, pz = p["pos"]
             near = math.hypot(px - x, py - y) < self.reach - 0.3 and abs(pz - z) < 3.7
-            if p["kind"] in WANTED and p["kind"] not in held and near:
-                return p["id"]
-        return None
+            if p["kind"] in kinds and near and (best is None or p["kind"] == "laser"):
+                best = p
+        return best
+
+    def _take(self, pickups: list, me: dict) -> int | None:
+        if None not in me["weapons"]:
+            return None
+        held = {w["kind"] for w in me["weapons"] if w}
+        found = self._in_reach(pickups, me, tuple(k for k in WANTED if k not in held))
+        return found["id"] if found else None
+
+    def _trade_for_laser(self, pickups: list, me: dict, mechs: list) -> tuple[int, int] | None:
+        """(pickup id, slot to drop) to swap the lightning in hand for a laser in reach.
+        Not with a mech inside 40 m: a weapon just taken cannot fire for 1.65 s."""
+        slot = next(
+            (i for i, w in enumerate(me["weapons"]) if w and w["kind"] == "lightning"), None
+        )
+        if slot is None or any(w and w["kind"] == "laser" for w in me["weapons"]):
+            return None
+        if any(m["_d"] < LASER_CLOSE for m in mechs):
+            return None
+        found = self._in_reach(pickups, me, ("laser",))
+        return (found["id"], slot) if found else None
 
     def _kill_cost(self, m: dict, t: float) -> float:
         """Lower is a better target: little health, close, and already shooting at me."""
@@ -508,17 +533,20 @@ class Bot:
         return best
 
     def _early_weapon(self, obs: dict, me: dict, t: float) -> tuple[float, float] | None:
-        """Lightning, else a laser, inside the current circle during the opening."""
-        if t >= EARLY_S or None not in me["weapons"]:
-            return None
+        """A laser, else lightning, inside the current circle during the opening. Holding
+        lightning, only a laser is worth the walk: it gets traded in."""
         held = {w["kind"] for w in me["weapons"] if w}
+        trade = "lightning" in held and "laser" not in held
+        if t >= EARLY_S or not (None in me["weapons"] or trade):
+            return None
+        wanted = ("laser",) if trade else WANTED
         x, y, z = me["pos"]
         center, radius = obs["zone"]["center"], obs["zone"]["radius"]
         best = None
         best_key = None
         for pickup in obs["pickups"]:
             kind = pickup["kind"]
-            if kind not in WANTED or kind in held or pickup["id"] in self.skip:
+            if kind not in wanted or kind in held or pickup["id"] in self.skip:
                 continue
             px, py = pickup["pos"][0], pickup["pos"][1]
             if math.hypot(px - center[0], py - center[1]) >= radius:
@@ -528,7 +556,7 @@ class Bot:
             d = math.hypot(px - x, py - y)
             if d > 90:
                 continue
-            key = (0 if kind == "lightning" else 1, d)
+            key = (0 if kind == "laser" else 1, d)
             if best_key is None or key < best_key:
                 best_key, best = key, (px, py)
         return best
@@ -600,7 +628,7 @@ class Bot:
         if None in me["weapons"]:
             for p in obs["pickups"]:
                 if p["kind"] in WANTED and p["kind"] not in held:
-                    consider(p, 90, 0, -30)
+                    consider(p, 90, 0, -40 if p["kind"] == "laser" else -30)
         for cube in obs["cubes"]:
             consider(cube, 70, 0, -20)
         for drop in obs["drops"]:
@@ -659,58 +687,100 @@ class Bot:
         flat = math.hypot(dx, dy)
         return math.atan2(dy, dx), math.atan2(dz, flat), flat
 
-    def _gunnery(self, me: dict, target: dict | None, farm: dict | None, t: float):
+    def _laser_mark(self, me: dict, mechs: list) -> dict | None:
+        """The weakest mech a full laser beam can hit, past the range where the gun is better.
+        None with two or more mechs close: charging halves our speed in the worst place for it."""
+        laser = next((w for w in me["weapons"] if w and w["kind"] == "laser"), None)
+        if laser is None or sum(m["_d"] < LASER_CLOSE for m in mechs) >= 2:
+            return None
+        reach = laser["stats"]["range"] * 0.95
+        x, y, _ = me["pos"]
+        nav = self.nav
+        far = [
+            m
+            for m in mechs
+            if LASER_CLOSE < m["_d"] <= reach
+            and not (nav and nav.hidden(x, y, m["pos"][0], m["pos"][1]))
+        ]
+        if not far:
+            return None
+        return min(far, key=lambda m: (m.get("hp", self.full_hp), m["_d"]))
+
+    def _gunnery(
+        self,
+        me: dict,
+        target: dict | None,
+        farm: dict | None,
+        t: float,
+        laser_at: dict | None = None,
+    ):
         """(aim or None, fire flags, whether the gun is being fired)."""
         fire = [False, False]
         aim_at = target or farm
-        if aim_at is None:
+        if aim_at is None and laser_at is None:
             return None, fire, False
         x, y, _ = me["pos"]
         nav = self.nav
-        grow = 1 + self.cfg["cubes"]["size_per_cube"] * aim_at.get("cubes", 0)
-        half_w = self.half_width[aim_at["kind"]] * grow
-        half_h = self.half_height[aim_at["kind"]] * grow
-        d = aim_at["_d"]
-        seen = not (nav and nav.hidden(x, y, aim_at["pos"][0], aim_at["pos"][1]))
         now_yaw, now_pitch = me["aim"]
         aim = None
         firing = False
 
-        def on_target(sol: tuple[float, float, float], slack: float) -> bool:
-            flat = max(sol[2], 1.0)
-            return (
-                abs(wrap(sol[0] - now_yaw)) < math.atan2(half_w * 0.9, flat) + slack
-                and abs(sol[1] - now_pitch) < math.atan2(half_h * 0.9, flat) + slack
-            )
+        if aim_at is not None:
+            grow = 1 + self.cfg["cubes"]["size_per_cube"] * aim_at.get("cubes", 0)
+            half_w = self.half_width[aim_at["kind"]] * grow
+            half_h = self.half_height[aim_at["kind"]] * grow
+            d = aim_at["_d"]
+            seen = not (nav and nav.hidden(x, y, aim_at["pos"][0], aim_at["pos"][1]))
 
-        for slot, weapon in enumerate(me["weapons"]):
-            if not weapon:
-                continue
-            kind, stats = weapon["kind"], weapon["stats"]
-            if kind == "gun":
-                lead = self._solution(me, aim_at, stats["speed"])
-                aim = aim or [lead[0], lead[1]]
-                ready = weapon["ammo"] > 0 and not weapon["reload"] and d < stats["range"] * 0.95
-                if ready and seen and on_target(lead, 0.05):
-                    fire[slot] = firing = True
-            elif kind == "lightning" and target is not None:
-                direct = self._solution(me, target, None)
-                near = d < stats["range"] - 2 and abs(wrap(direct[0] - now_yaw)) < 0.2
-                fire[slot] = near and seen and me["energy"] > stats["energy"]
-            elif kind == "laser" and target is not None:
-                direct = self._solution(me, target, None)
+            def on_target(sol: tuple[float, float, float], slack: float) -> bool:
+                flat = max(sol[2], 1.0)
+                return (
+                    abs(wrap(sol[0] - now_yaw)) < math.atan2(half_w * 0.9, flat) + slack
+                    and abs(sol[1] - now_pitch) < math.atan2(half_h * 0.9, flat) + slack
+                )
+
+            for slot, weapon in enumerate(me["weapons"]):
+                if not weapon:
+                    continue
+                kind, stats = weapon["kind"], weapon["stats"]
+                if kind == "gun":
+                    lead = self._solution(me, aim_at, stats["speed"])
+                    aim = aim or [lead[0], lead[1]]
+                    ready = (
+                        weapon["ammo"] > 0 and not weapon["reload"] and d < stats["range"] * 0.95
+                    )
+                    if ready and seen and on_target(lead, 0.05):
+                        fire[slot] = firing = True
+                elif kind == "lightning" and target is not None:
+                    direct = self._solution(me, target, None)
+                    near = d < stats["range"] - 2 and abs(wrap(direct[0] - now_yaw)) < 0.2
+                    fire[slot] = near and seen and me["energy"] > stats["energy"]
+
+        if laser_at is not None:
+            for slot, weapon in enumerate(me["weapons"]):
+                if not weapon or weapon["kind"] != "laser":
+                    continue
+                direct = self._solution(me, laser_at, None)
                 charge = weapon.get("charge", 0)
-                full = stats["charge"]
+                full = weapon["stats"]["charge"]
+                grow = 1 + self.cfg["cubes"]["size_per_cube"] * laser_at.get("cubes", 0)
+                half_w = self.half_width[laser_at["kind"]] * grow
+                half_h = self.half_height[laser_at["kind"]] * grow
+                flat = max(direct[2], 1.0)
+                lined = abs(wrap(direct[0] - now_yaw)) < math.atan2(half_w * 0.9, flat) and abs(
+                    direct[1] - now_pitch
+                ) < math.atan2(half_h * 0.9, flat)
                 if charge > 0:
                     if charge >= full - 0.15:
                         aim = [direct[0], direct[1]]  # the beam is instant: stop leading
-                    fire[slot] = not (charge >= full - 0.06 and on_target(direct, 0.0))
+                    fire[slot] = not (charge >= full - 0.06 and lined)
                 else:
                     usable = weapon["cooldown"] <= 0.05 and t >= self.laser_off_until
-                    safe = not self.retreat and me["in_zone"]
-                    fire[slot] = usable and safe and seen and d < stats["range"] * 0.95
-        if aim is None:  # no gun in hand
-            direct = self._solution(me, aim_at, None)
+                    fire[slot] = usable and me["in_zone"]
+                break
+
+        if aim is None:  # no gun in hand, or only a laser target
+            direct = self._solution(me, aim_at or laser_at, None)
             aim = [direct[0], direct[1]]
         return aim, fire, firing
 
