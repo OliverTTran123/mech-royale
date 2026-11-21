@@ -30,6 +30,8 @@ LOUD = {"gun", "laser", "laser_charge", "lightning", "mortar", "step", "boost", 
 MEMORY_S = 5.0  # keep a mech after it leaves the observation
 SHOOT_M = 15.0  # fire only inside this range, and only if cover is more than a second away
 LOOT_M = 60.0  # do not detour for loot with a mech this close
+LATE_ALIVE = 4  # endgame: this many mechs left, counting us
+LATE_RADIUS = 60.0  # or the current circle is already this small
 PHANTOM_M = 50.0  # where to place a shooter we know only by bearing
 STEP_SPEED = 5.0  # above this, footsteps give the position away
 REST_SPEED = 3.2  # under the step threshold: silent shuffle while regenerating
@@ -246,6 +248,7 @@ class Bot:
         known = self._known_points(x, y)
         nearest = min((math.hypot(ex - x, ey - y) for ex, ey in known), default=1e9)
         walk = me["stats"]["walk_speed"]
+        late = obs.get("alive", 16) <= LATE_ALIVE or zone["radius"] < LATE_RADIUS
 
         mechs = []
         for m in obs["mechs"]:
@@ -272,6 +275,8 @@ class Bot:
             elif d_out > 0:
                 yaw = self._inward_yaw(me, zone)
                 boost = False
+            elif late:
+                yaw, length = self._late_hold(me, known, cx, cy, safe_r, d_out)
             else:
                 looting = False
                 if config.LOOT and nearest > LOOT_M:
@@ -332,7 +337,7 @@ class Bot:
             action["reload"] = True
         if obs["offer"]:
             action["pick"] = self._pick(obs["offer"]) if config.LOOT else 0
-        if config.LOOT and nearest > LOOT_M:
+        if config.LOOT and not late and nearest > LOOT_M:
             take = self._take(obs["pickups"], me)
             if take is not None:
                 action["take"] = take
@@ -436,6 +441,44 @@ class Bot:
             if score > best_score:
                 best_yaw, best_score = yaw, score
         return best_yaw
+
+    def _buildings_between(self, x: float, y: float, known: list[tuple[float, float]]) -> int:
+        nav = self.nav
+        if nav is None:
+            return 0
+        return sum(nav.hidden(x, y, ex, ey) for ex, ey in known)
+
+    def _late_hold(
+        self,
+        me: dict,
+        known: list[tuple[float, float]],
+        cx: float,
+        cy: float,
+        safe_r: float,
+        d_out: float,
+    ) -> tuple[float | None, float]:
+        """Stand where the most buildings break sight. Move to improve that, or to get inside."""
+        x, y, _ = me["pos"]
+        here = self._buildings_between(x, y, known)
+        here_dist = math.hypot(x - cx, y - cy)
+        best_yaw, best = None, here
+        for k in range(16):
+            yaw = self._steer(x, y, k * TWO_PI / 16)
+            px, py = x + 12 * math.cos(yaw), y + 12 * math.sin(yaw)
+            if math.hypot(px - cx, py - cy) > safe_r:
+                continue
+            closer = math.hypot(px - cx, py - cy) < here_dist - 0.5
+            if d_out > 0 and not closer:
+                continue
+            score = self._buildings_between(px, py, known)
+            better = score > best or (d_out > 0 and best_yaw is None)
+            if better:
+                best, best_yaw = score, yaw
+        if best_yaw is None and d_out > 0:
+            return math.atan2(cy - y, cx - x), 1.0
+        if best_yaw is None:
+            return None, 0.0
+        return best_yaw, 1.0
 
     def _point_blank(self, me: dict, mechs: list, zone: dict, walk: float) -> dict | None:
         """Closest mech inside SHOOT_M that one second of walking cannot hide from."""
