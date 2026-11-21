@@ -11,6 +11,9 @@ ZONE = True
 # at range, run out from under mortar shells. Off (starter): enemies never change where it walks.
 THREAT_RETREAT = False  # stand and shoot; do not back off, circle, or dodge shells
 
+# On: back off when two or more mechs are aiming at us. Off: stand and shoot.
+AIMED_RETREAT = False
+
 # Loot. On: walk to cubes, a laser or lightning and supply drops when no mech is near, shoot crates
 # and drones for cubes when healthy, never take a mortar, rank upgrades.
 # Off (starter): take the first non-gun weapon in reach, always pick upgrade 0, never detour.
