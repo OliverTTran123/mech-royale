@@ -23,8 +23,8 @@ WANTED = ("laser", "lightning")  # a mortar is skipped: it invites laser cook-of
 EARLY_S = 90.0  # opening: detour for a weapon even with a mech nearby, and farm cubes
 FARM_CLEAR = 80.0  # opening: crates and drones come before a mech that is no closer than this
 SWARM_S = 5.0  # two drones shooting at me: stay clear of drones this long
-UPGRADES = [  # most wanted first: staying alive, then damage
-    "armor", "plating", "nanites", "gun_damage", "gun_rate", "servos", "laser_damage",
+UPGRADES = [  # most wanted first: kill speed with the gun, then staying alive
+    "gun_damage", "gun_rate", "armor", "plating", "nanites", "servos", "laser_damage",
     "lightning_efficiency", "gyros", "gun_mag", "laser_charge", "gun_velocity", "lightning_range",
     "lightning_chain", "reactor", "jets", "capacitor", "sensors", "laser_pierce",
 ]  # fmt: skip
