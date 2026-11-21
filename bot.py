@@ -59,6 +59,8 @@ class Bot:
                 mf.log(f"no map, steering blind: {error!r}")
 
         self.attackers: dict[int, float] = {}  # mech id -> last time it damaged me
+        self.last_attacker: int | None = None  # whose shot we must face (rear hits are x1.5)
+        self.last_bearing: float | None = None
         self.hurt_t = self.npc_hurt_t = self.heard_t = self.last_threat_t = -99.0
         self.hurt_bearing = self.heard_bearing = 0.0
         self.laser_off_until = 0.0
@@ -101,17 +103,22 @@ class Bot:
         )
         hp = me["hp"]
         frac = hp / me["max_hp"]
-        if threats and config.THREAT_RETREAT:
+        facing = self._facing_us(mechs, x, y)
+        if (threats or facing >= 2) and config.THREAT_RETREAT:
             self.last_threat_t = t
-            nearest_hp = threats[0].get("hp", self.full_hp)
-            if len(threats) >= 2 or frac < 0.4 or hp < 0.6 * nearest_hp:
+            nearest_hp = threats[0].get("hp", self.full_hp) if threats else self.full_hp
+            hurt = bool(threats) and (frac < 0.4 or hp < 0.6 * nearest_hp)
+            if facing >= 2 or hurt:
                 self.retreat = True
-            elif frac >= 0.7 and hp >= 0.8 * nearest_hp:
+            elif facing < 2 and frac >= 0.7 and hp >= 0.8 * nearest_hp:
                 self.retreat = False
         elif t - self.last_threat_t > 3:
             self.retreat = False
-        focus = None  # the threat to circle and, with TARGETING, to shoot
-        if threats and config.TARGETING:
+        focus = None  # who to circle: the weakest mech we can actually hit
+        hunted = self._lowest_hp(me, mechs) if config.TARGETING else None
+        if hunted is not None:
+            focus = hunted
+        elif threats and config.TARGETING:
             focus = min(threats, key=lambda m: self._kill_cost(m, t))
         elif threats:
             focus = threats[0]
@@ -141,9 +148,10 @@ class Bot:
         elif urgent:
             yaw = self._toward(me, nc[0], nc[1], True)
             boost = not me["in_zone"] or t >= zone["shrink_start"]
-        elif config.THREAT_RETREAT and self.retreat and threats:
-            yaw = self._flee(me, threats, zone, t)
-            boost = threats[0]["_d"] < 120
+        elif config.THREAT_RETREAT and self.retreat and (threats or facing >= 2):
+            flee_from = threats or [m for m in mechs if self._aimed_at_us(m, x, y)]
+            yaw = self._flee(me, flee_from, zone, t)
+            boost = flee_from[0]["_d"] < 120
         elif config.THREAT_RETREAT and focus is not None:
             yaw = self._strafe(me, focus, zone, t)
         elif loot is not None:
@@ -185,6 +193,13 @@ class Bot:
             if config.LOOT and calm and focus is None:
                 farm = self._farm_target(obs, me, npcs, t, healthy)
             aim, fire, firing = self._gunnery(me, focus, farm, t)
+            faced = self._face_attacker(me, mechs)
+            if faced is not None:
+                attacker = next((m for m in mechs if m["id"] == self.last_attacker), None)
+                if attacker is not None:
+                    aim, fire, firing = self._gunnery(me, attacker, None, t)
+                else:
+                    aim, fire, firing = [faced[0], faced[1]], [False, False], False
             if aim is None:
                 aim = [self._look(obs["sounds"], me, t, yaw), 0.0]
         elif mechs:
@@ -267,6 +282,8 @@ class Bot:
                 elif e.get("by") is not None:
                     self.attackers[e["by"]] = t
                     self.hurt_t = t
+                    self.last_attacker = e["by"]
+                    self.last_bearing = e.get("bearing")
                     if e.get("bearing") is not None:
                         self.hurt_bearing = e["bearing"]
             elif kind == "effect" and e["effect"] == "short":
@@ -289,6 +306,48 @@ class Bot:
             near = math.hypot(px - x, py - y) < self.reach - 0.3 and abs(pz - z) < 3.7
             if p["kind"] in WANTED and p["kind"] not in held and near:
                 return p["id"]
+        return None
+
+    def _weapon_range(self, me: dict) -> float:
+        best = 0.0
+        for weapon in me["weapons"]:
+            if not weapon:
+                continue
+            kind, stats = weapon["kind"], weapon["stats"]
+            if kind == "lightning":
+                best = max(best, stats["range"] - 2)
+            elif kind in ("gun", "laser"):
+                best = max(best, stats["range"] * 0.95)
+        return best
+
+    def _lowest_hp(self, me: dict, mechs: list) -> dict | None:
+        reach = self._weapon_range(me)
+        inside = [m for m in mechs if m["_d"] <= reach]
+        if not inside:
+            return None
+        return min(inside, key=lambda m: (m.get("hp", self.full_hp), m["_d"]))
+
+    def _aimed_at_us(self, mech: dict, x: float, y: float) -> bool:
+        ex, ey = mech["pos"][0], mech["pos"][1]
+        dist = max(mech.get("_d", math.hypot(ex - x, ey - y)), 1.0)
+        bearing = math.atan2(y - ey, x - ex)
+        return abs(wrap(mech["aim"][0] - bearing)) < max(0.12, math.atan2(3.0, dist))
+
+    def _facing_us(self, mechs: list, x: float, y: float) -> int:
+        return sum(self._aimed_at_us(m, x, y) for m in mechs)
+
+    def _face_attacker(self, me: dict, mechs: list) -> tuple[float, float] | None:
+        """Where to look so the last hit is in the front arc (rear shots are x1.5)."""
+        if self.last_attacker is None:
+            return None
+        seen = next((m for m in mechs if m["id"] == self.last_attacker), None)
+        if seen is not None:
+            gun = next((w for w in me["weapons"] if w and w["kind"] == "gun"), None)
+            speed = gun["stats"]["speed"] if gun else None
+            sol = self._solution(me, seen, speed)
+            return sol[0], sol[1]
+        if self.last_bearing is not None:
+            return self.last_bearing, 0.0
         return None
 
     def _kill_cost(self, m: dict, t: float) -> float:
