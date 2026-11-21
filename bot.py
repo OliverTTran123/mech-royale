@@ -67,6 +67,7 @@ class Bot:
         self.flee_at = -99.0
         self.strafe_sign = 1
         self.strafe_until = 0.0
+        self.orbit_sign = 1
         self.side = 1  # which way feelers turn first
         self.slow = 0  # decisions spent pushing without moving
         self.jetting = False
@@ -153,6 +154,8 @@ class Bot:
             yaw = math.atan2(nc[1] - y, nc[0] - x)
         elif d_out > 0:
             yaw = self._toward(me, nc[0], nc[1], True)
+        else:
+            yaw = self._orbit(me, zone)  # inside, nothing to chase: don't be a stopped target
 
         if config.ZONE:  # pushing against something: jump and jet over it
             speed = math.hypot(me["vel"][0], me["vel"][1])
@@ -322,6 +325,27 @@ class Bot:
                         self.side = s
                     return a
         return yaw
+
+    def _orbit(self, me: dict, zone: dict) -> float:
+        """Walk a full-speed circle inside the next safe radius, clear of walls."""
+        x, y, _ = me["pos"]
+        cx, cy = zone["next_center"]
+        nr = zone["next_radius"]
+        safe_r = nr - min(20.0, 0.3 * nr) if nr > 0 else max(2.0, 0.4 * zone["radius"])
+        dx, dy = x - cx, y - cy
+        dist = math.hypot(dx, dy)
+        ux, uy = (dx / dist, dy / dist) if dist > 1 else (1.0, 0.0)
+        for sign in (self.orbit_sign, -self.orbit_sign):
+            tx, ty = -sign * uy, sign * ux
+            pull = 0.0 if dist < max(4.0, safe_r - 8) else min(1.5, (dist - (safe_r - 8)) / 8)
+            vx, vy = tx - pull * ux, ty - pull * uy
+            yaw = self._steer(x, y, math.atan2(vy, vx))
+            px = x + 8 * math.cos(yaw)
+            py = y + 8 * math.sin(yaw)
+            if math.hypot(px - cx, py - cy) <= safe_r:
+                self.orbit_sign = sign
+                return yaw
+        return self._steer(x, y, math.atan2(-uy, -ux))
 
     def _strafe(self, me: dict, target: dict, zone: dict, t: float) -> float:
         """Circle the target at a preferred range, switching direction at random to spoil leads."""
