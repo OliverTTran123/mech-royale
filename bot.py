@@ -24,6 +24,7 @@ EARLY_S = 90.0  # opening: detour for a weapon even with a mech nearby, and farm
 FARM_CLEAR = 80.0  # opening: crates and drones come before a mech that is no closer than this
 SWARM_S = 5.0  # two drones shooting at me: stay clear of drones this long
 CUBE_M = 70.0  # walk to a cube this close at any health, even with a mech nearby
+CUBE_GIVE_UP_S = 15.0  # still walking at the same cube after this long: it cannot be reached
 LIGHTNING_CLOSE = 38.0  # holding lightning: walk at the target until it is inside the arc
 UPGRADES = [  # most wanted first: less reloading, then gun damage, then staying alive
     "gun_mag", "gun_damage", "gun_rate", "armor", "plating", "nanites", "servos", "laser_damage",
@@ -82,6 +83,8 @@ class Bot:
         self.was_moving = False
         self.loot_id = -1
         self.loot_since = 0.0
+        self.cube_id = -1
+        self.cube_since = 0.0
         self.skip: set[int] = set()  # loot given up on
 
     # ------------------------------------------------------------------ one decision
@@ -486,6 +489,7 @@ class Bot:
         x, y, z = me["pos"]
         best = None
         best_d = 1e9
+        best_id = -1
         for cube in obs["cubes"]:
             if cube["id"] in self.skip:
                 continue
@@ -494,7 +498,13 @@ class Bot:
                 continue
             d = math.hypot(px - x, py - y)
             if d <= CUBE_M and d < best_d:
-                best_d, best = d, (px, py)
+                best_d, best, best_id = d, (px, py), cube["id"]
+        if best is None:
+            return None
+        if best_id != self.cube_id:
+            self.cube_id, self.cube_since = best_id, t
+        elif t - self.cube_since > CUBE_GIVE_UP_S:
+            self.skip.add(best_id)  # cannot get to it: stop trying
         return best
 
     def _early_weapon(self, obs: dict, me: dict, t: float) -> tuple[float, float] | None:
