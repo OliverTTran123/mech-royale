@@ -4,6 +4,7 @@
 - threats: back off behind cover when outnumbered or losing, and let health regenerate;
 - loot: collect cubes, a laser or lightning, and supply drops while nobody is near;
 - targets: shoot the mech that is cheapest to kill, leading the shot.
+- evade, when that flag is on: do not start a fight; run for distance and cover.
 
 Legs and torso are independent, so movement and aim are decided separately each decision.
 Each rule has a flag in config.py; with a flag off, that part does what the kit's starter does.
@@ -26,6 +27,12 @@ UPGRADES = [  # most wanted first: staying alive, then damage
     "lightning_chain", "reactor", "jets", "capacitor", "sensors", "laser_pierce",
 ]  # fmt: skip
 LOUD = {"gun", "laser", "laser_charge", "lightning", "mortar", "step", "boost", "jet"}
+MEMORY_S = 5.0  # keep a mech after it leaves the observation
+SHOOT_M = 15.0  # fire only inside this range, and only if cover is more than a second away
+LOOT_M = 60.0  # do not detour for loot with a mech this close
+PHANTOM_M = 50.0  # where to place a shooter we know only by bearing
+STEP_SPEED = 5.0  # above this, footsteps give the position away
+REST_SPEED = 3.2  # under the step threshold: silent shuffle while regenerating
 
 
 def wrap(angle: float) -> float:
@@ -52,13 +59,15 @@ class Bot:
             "crate": cfg["crates"]["radius"],
         }
         self.nav: Nav | None = None
-        if config.ZONE or config.THREAT_RETREAT or config.LOOT or config.TARGETING:
+        if config.EVADE or config.ZONE or config.THREAT_RETREAT or config.LOOT or config.TARGETING:
             try:
                 self.nav = Nav(hello["map"]["dir"])
             except (OSError, ValueError, KeyError) as error:
                 mf.log(f"no map, steering blind: {error!r}")
 
         self.attackers: dict[int, float] = {}  # mech id -> last time it damaged me
+        self.seen: dict[int, tuple[float, float, float]] = {}  # id -> last x, y, time
+        self.phantoms: dict[int, tuple[float, float]] = {}  # id -> bearing, time
         self.hurt_t = self.npc_hurt_t = self.heard_t = self.last_threat_t = -99.0
         self.hurt_bearing = self.heard_bearing = 0.0
         self.laser_off_until = 0.0
@@ -79,6 +88,8 @@ class Bot:
 
     # ------------------------------------------------------------------ one decision
     def act(self, obs: mf.Observation) -> mf.Action:
+        if config.EVADE:
+            return self._act_evade(obs)
         if not (config.ZONE or config.THREAT_RETREAT or config.LOOT or config.TARGETING):
             return self._starter(obs)
         me = obs["self"]
@@ -216,6 +227,205 @@ class Bot:
         if take is not None:
             action["take"] = take
         return action
+
+    def _act_evade(self, obs: mf.Observation) -> mf.Action:
+        """Stay alive: no fights, distance and buildings, the next circle, regen when unknown."""
+        me = obs["self"]
+        t = obs["t"]
+        x, y, z = me["pos"]
+        zone = obs["zone"]
+        self._events(obs["events"], t)
+        self._remember(obs, t, x, y)
+        known = self._known_points(x, y)
+        nearest = min((math.hypot(ex - x, ey - y) for ex, ey in known), default=1e9)
+        walk = me["stats"]["walk_speed"]
+        cx, cy, safe_r = self._margin(zone)
+        d_out = math.hypot(x - cx, y - cy) - safe_r
+
+        mechs = []
+        for m in obs["mechs"]:
+            if m["kind"] == "mech":
+                m["_d"] = math.hypot(m["pos"][0] - x, m["pos"][1] - y)
+                mechs.append(m)
+
+        yaw: float | None = None
+        length = 1.0
+        boost = False
+        dodge = self._shell_dodge(obs["projectiles"], x, y, z) if config.THREAT_RETREAT else None
+        if dodge is not None:
+            yaw, boost = dodge, True
+        elif d_out > 0:
+            yaw = self._evade_yaw(me, zone, known, safe_r)
+            boost = not me["in_zone"]
+        else:
+            looting = False
+            if config.LOOT and nearest > LOOT_M:
+                loot = self._loot(obs, me, [], t, False)  # no crates: those need a shot
+                if loot is not None and math.hypot(loot[0] - x, loot[1] - y) > loot[2]:
+                    yaw = self._toward(me, loot[0], loot[1], False)
+                    looting = True
+            if not looting and known:
+                yaw = self._evade_yaw(me, zone, known, safe_r)
+            elif not looting and self.nav and self.nav.by_cover(x, y):
+                length = 0.0  # behind a building and nobody known: stand and regenerate
+            elif not looting:
+                yaw = self._orbit(me, zone)  # open ground: shuffle in place, quietly
+                length = REST_SPEED / walk
+
+        if config.ZONE and yaw is not None:
+            speed = math.hypot(me["vel"][0], me["vel"][1])
+            self.slow = self.slow + 1 if self.was_moving and speed < 2.0 else 0
+            self.was_moving = True
+            if self.jetting:
+                cleared = speed > 4.0 and t - self.jet_start > 0.5
+                if cleared or me["energy"] < 4 or t - self.jet_start > 7:
+                    self.jetting = False
+            elif self.slow >= 5 and me["energy"] >= 40:
+                self.jetting, self.jet_start, self.slow = True, t, 0
+                self.side = -self.side
+            jump = self.jetting and me["grounded"]
+            if self.jetting:
+                boost = True
+        else:
+            self.was_moving = yaw is not None
+            jump = False
+        if boost and me["energy"] < 2:
+            boost = False
+
+        aim, fire = [self._look(obs["sounds"], me, t, yaw), 0.0], [False, False]
+        threat = self._point_blank(me, mechs, zone, walk)
+        gun = next((w for w in me["weapons"] if w and w["kind"] == "gun"), None)
+        if threat is not None and gun and not gun["reload"]:
+            lead = self._solution(me, threat, gun["stats"]["speed"])
+            aim = [lead[0], lead[1]]
+            if gun["ammo"] > 0 and self._aligned(me, lead, threat):
+                fire[0] = True
+
+        if length == 0.0 or yaw is None:
+            move = [0.0, 0.0]
+        else:
+            move = [round(length * math.cos(yaw), 3), round(length * math.sin(yaw), 3)]
+        action: mf.Action = {
+            "move": move,
+            "boost": boost,
+            "jump": jump,
+            "aim": [round(wrap(aim[0]), 4), round(aim[1], 4)],
+            "fire": fire,
+        }
+        topping_up = gun and not gun["reload"] and gun["ammo"] < gun["stats"]["mag"]
+        if config.TARGETING and topping_up and nearest > LOOT_M and not fire[0]:
+            action["reload"] = True
+        if obs["offer"]:
+            action["pick"] = self._pick(obs["offer"]) if config.LOOT else 0
+        if config.LOOT and nearest > LOOT_M:
+            take = self._take(obs["pickups"], me)
+            if take is not None:
+                action["take"] = take
+        return action
+
+    def _remember(self, obs: dict, t: float, x: float, y: float) -> None:
+        live = set()
+        for mech in obs["mechs"]:
+            if mech["kind"] != "mech":
+                continue
+            live.add(mech["id"])
+            self.seen[mech["id"]] = (mech["pos"][0], mech["pos"][1], t)
+        stale = [mid for mid, (_, _, seen_at) in self.seen.items() if t - seen_at > MEMORY_S]
+        for mid in stale:
+            del self.seen[mid]
+        for event in obs["events"]:
+            if event.get("type") != "damaged":
+                continue
+            attacker, bearing = event.get("by"), event.get("bearing")
+            if attacker is None or bearing is None or attacker in live or attacker in self.seen:
+                continue
+            self.phantoms[attacker] = (bearing, t)
+        gone = [
+            mid for mid, (_, at) in self.phantoms.items() if t - at > MEMORY_S or mid in self.seen
+        ]
+        for mid in gone:
+            del self.phantoms[mid]
+
+    def _known_points(self, x: float, y: float) -> list[tuple[float, float]]:
+        points = [(px, py) for px, py, _ in self.seen.values()]
+        for bearing, _ in self.phantoms.values():
+            points.append((x + PHANTOM_M * math.cos(bearing), y + PHANTOM_M * math.sin(bearing)))
+        return points
+
+    def _margin(self, zone: dict) -> tuple[float, float, float]:
+        center, radius = zone["next_center"], zone["next_radius"]
+        margin = radius - min(20.0, 0.3 * radius) if radius > 0 else max(2.0, 0.4 * zone["radius"])
+        return center[0], center[1], margin
+
+    def _evade_yaw(
+        self, me: dict, zone: dict, known: list[tuple[float, float]], safe_r: float
+    ) -> float:
+        """Heading that gains distance, puts buildings in the way, and stays in the next circle."""
+        x, y, _ = me["pos"]
+        cx, cy, _ = self._margin(zone)
+        nav = self.nav
+        best_yaw, best_score = 0.0, -1e18
+        for k in range(16):
+            yaw = self._steer(x, y, k * TWO_PI / 16)
+            px, py = x + 12 * math.cos(yaw), y + 12 * math.sin(yaw)
+            score = 0.0
+            for ex, ey in known:
+                score += math.hypot(px - ex, py - ey) - math.hypot(x - ex, y - ey)
+                if nav and nav.hidden(px, py, ex, ey):
+                    score += 18  # a building between this point and that mech
+            if nav and nav.by_cover(px, py):
+                score += 12
+            elif nav:
+                score -= 10  # open ground
+            over = math.hypot(px - cx, py - cy) - safe_r
+            if over > 0:
+                score -= 400 + over
+            if score > best_score:
+                best_yaw, best_score = yaw, score
+        return best_yaw
+
+    def _point_blank(self, me: dict, mechs: list, zone: dict, walk: float) -> dict | None:
+        """Closest mech inside SHOOT_M that one second of walking cannot hide from."""
+        x, y, _ = me["pos"]
+        nav = self.nav
+        stuck = []
+        for mech in mechs:
+            if mech["_d"] > SHOOT_M:
+                continue
+            ex, ey = mech["pos"][0], mech["pos"][1]
+            if nav and nav.hidden(x, y, ex, ey):
+                continue
+            if not self._can_hide(x, y, ex, ey, zone, walk):
+                stuck.append(mech)
+        if not stuck:
+            return None
+        return min(stuck, key=lambda m: m["_d"])
+
+    def _can_hide(self, x: float, y: float, ex: float, ey: float, zone: dict, walk: float) -> bool:
+        nav = self.nav
+        if nav is None:
+            return False
+        cx, cy, safe_r = self._margin(zone)
+        reach = walk * 1.0
+        for k in range(12):
+            yaw = self._steer(x, y, k * TWO_PI / 12)
+            px, py = x + reach * math.cos(yaw), y + reach * math.sin(yaw)
+            if math.hypot(px - cx, py - cy) > safe_r:
+                continue
+            if nav.hidden(px, py, ex, ey):
+                return True
+        return False
+
+    def _aligned(self, me: dict, sol: tuple[float, float, float], target: dict) -> bool:
+        grow = 1 + self.cfg["cubes"]["size_per_cube"] * target.get("cubes", 0)
+        half_w = self.half_width[target["kind"]] * grow
+        half_h = self.half_height[target["kind"]] * grow
+        flat = max(sol[2], 1.0)
+        now_yaw, now_pitch = me["aim"]
+        return (
+            abs(wrap(sol[0] - now_yaw)) < math.atan2(half_w * 0.9, flat) + 0.05
+            and abs(sol[1] - now_pitch) < math.atan2(half_h * 0.9, flat) + 0.05
+        )
 
     def _starter(self, obs: mf.Observation) -> mf.Action:
         """The kit's example bot, verbatim in effect: straight at the next center, hop every 2 s,

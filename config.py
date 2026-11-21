@@ -1,5 +1,7 @@
 """Feature flags, one per heuristic. Turning a flag off falls back to what the kit's starter bot
-(example_bot.py) does for that part; with all four off the bot plays exactly like the starter.
+(example_bot.py) does for that part; with all of them off the bot plays exactly like the starter.
+
+EVADE replaces movement and fire with the survival pivot. Off: the keep-moving rules below.
 """
 
 # Legs toward the zone. On: reach the next circle before the shrink, following the map's flow
@@ -20,3 +22,10 @@ LOOT = True
 # and release the laser, reload between fights, look around when nothing is in sight.
 # Off (starter): aim straight at the nearest mech and hold both triggers; else face the next center.
 TARGETING = True
+
+# Survival pivot. On: never start a fight. Shoot only a mech inside 15 m that we cannot
+# break sight of within a second. Run to maximize distance from everything known (seen,
+# remembered 5 s, or a bearing from a shooter we never saw), behind buildings, inside the
+# next circle. Rest on cover when nothing is known. Loot only with no mech inside 60 m.
+# Off: the rules above, including orbiting instead of standing still.
+EVADE = True

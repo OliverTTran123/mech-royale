@@ -41,6 +41,7 @@ class Nav:
         self._mark_border(raw, world["bounds"])
         self.raw = raw
         self.blocked = self._inflate(raw)  # one cell of clearance for the mech's radius
+        self.beside = self._mark_beside()  # walkable cells with a building within 8 m
 
         self.dist = array("H", [UNSEEN]) * n
         self.goal: tuple[float, float] | None = None
@@ -113,6 +114,25 @@ class Nav:
             out[c] = out[c + w - 1] = 1
         return out
 
+    def _mark_beside(self) -> bytearray:
+        """Cells a mech can stand in that have a sight-blocking building within 8 m."""
+        w, h, tall, blocked = self.w, self.h, self.tall, self.blocked
+        beside = bytearray(len(tall))
+        rad = 4
+        for c, is_tall in enumerate(tall):
+            if not is_tall:
+                continue
+            j, i = divmod(c, w)
+            j0, j1 = max(1, j - rad), min(h - 2, j + rad)
+            i0, i1 = max(1, i - rad), min(w - 2, i + rad)
+            for jj in range(j0, j1 + 1):
+                row = jj * w
+                for ii in range(i0, i1 + 1):
+                    cell = row + ii
+                    if not blocked[cell]:
+                        beside[cell] = 1
+        return beside
+
     # ------------------------------------------------------------------ lookups
     def cell(self, x: float, y: float) -> int:
         i = min(self.w - 1, max(0, int((x - self.min_x) / CELL)))
@@ -158,6 +178,10 @@ class Nav:
     def hidden(self, x0: float, y0: float, x1: float, y1: float) -> bool:
         """Does a tall building stand between the two points?"""
         return self._ray(self.tall, x0, y0, x1, y1, False)
+
+    def by_cover(self, x: float, y: float) -> bool:
+        """Is (x, y) a walkable cell with a building within 8 m?"""
+        return bool(self.beside[self.cell(x, y)])
 
     # ------------------------------------------------------------------ flow field
     def set_goal(self, x: float, y: float) -> None:
