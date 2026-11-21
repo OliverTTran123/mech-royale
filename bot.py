@@ -20,7 +20,9 @@ TWO_PI = 2 * math.pi
 FIELD_CELLS_PER_TICK = 4000  # flow-field work per decision, about 2 ms
 ENGAGE = 170.0  # mechs closer than this are threats and targets
 WANTED = ("laser", "lightning")  # a mortar is skipped: it invites laser cook-off
-EARLY_S = 90.0  # opening: detour for a weapon even with a mech nearby
+EARLY_S = 90.0  # opening: detour for a weapon even with a mech nearby, and farm cubes
+FARM_CLEAR = 80.0  # opening: crates and drones come before a mech that is no closer than this
+SWARM_S = 5.0  # two drones shooting at me: stay clear of drones this long
 UPGRADES = [  # most wanted first: staying alive, then damage
     "armor", "plating", "nanites", "gun_damage", "gun_rate", "servos", "laser_damage",
     "lightning_efficiency", "gyros", "gun_mag", "laser_charge", "gun_velocity", "lightning_range",
@@ -60,6 +62,8 @@ class Bot:
                 mf.log(f"no map, steering blind: {error!r}")
 
         self.attackers: dict[int, float] = {}  # mech id -> last time it damaged me
+        self.drone_hits: dict[int, float] = {}  # drone id -> last time it damaged me
+        self.swarm_until = -99.0
         self.hurt_t = self.npc_hurt_t = self.heard_t = self.last_threat_t = -99.0
         self.hurt_bearing = self.heard_bearing = 0.0
         self.laser_off_until = 0.0
@@ -128,12 +132,26 @@ class Bot:
             and (not me["in_zone"] or t + d_out / walk * 1.3 + 8 >= zone["shrink_start"])
         )
         calm = not threats
-        healthy = frac >= 0.8
+        crates_ok = drones_ok = frac >= 0.8  # shooting restarts the regeneration timer
+        away: list = []  # drones to back off from
+        farming = (
+            config.LOOT
+            and t < EARLY_S
+            and t - self.hurt_t > 4
+            and all(m["_d"] >= FARM_CLEAR for m in mechs)
+        )
+        if farming:  # opening, no mech close or hitting me: cubes come before a far mech
+            calm = crates_ok = True
+            swarmed = self._swarmed(npcs, x, y, t)
+            drones_ok = frac > 0.7 and not swarmed
+            if swarmed:
+                reach = self.cfg["npc"]["deaggro_range"]
+                away = sorted((n for n in npcs if n["_d"] < reach), key=lambda n: n["_d"])
         loot = dodge = None
         weapon = self._early_weapon(obs, me, t) if config.LOOT and not urgent else None
         drop = self._drop_commit(obs, me, mechs, t) if config.LOOT and not urgent else None
         if config.LOOT and calm and not urgent:
-            loot = self._loot(obs, me, npcs, t, healthy)
+            loot = self._loot(obs, me, npcs, t, crates_ok, drones_ok)
         if config.THREAT_RETREAT:
             dodge = self._shell_dodge(obs["projectiles"], x, y, z)
         yaw: float | None = None
@@ -148,6 +166,9 @@ class Bot:
             yaw = self._toward(me, weapon[0], weapon[1], False)
         elif drop is not None:
             yaw = self._drop_yaw(me, drop)
+        elif away:
+            yaw = self._flee(me, away, zone, t)
+            boost = away[0]["_d"] < self.cfg["npc"]["aggro_range"]
         elif config.THREAT_RETREAT and self.retreat and threats:
             yaw = self._flee(me, threats, zone, t)
             boost = threats[0]["_d"] < 120
@@ -187,11 +208,15 @@ class Bot:
 
         # --- torso
         firing = False
-        if config.TARGETING:
+        if config.TARGETING and away:  # backing off: keep the drones in the front arc, hold fire
+            facing = self._solution(me, away[0], None)
+            aim, fire = [facing[0], facing[1]], [False, False]
+        elif config.TARGETING:
             farm = None
-            if config.LOOT and calm and focus is None:
-                farm = self._farm_target(obs, me, npcs, t, healthy)
-            aim, fire, firing = self._gunnery(me, focus, farm, t)
+            if config.LOOT and calm and (focus is None or farming):
+                farm = self._farm_target(obs, me, npcs, t, crates_ok, drones_ok)
+            target = None if farming and farm is not None else focus
+            aim, fire, firing = self._gunnery(me, target, farm, t)
             if aim is None:
                 aim = [self._look(obs["sounds"], me, t, yaw), 0.0]
         elif mechs:
@@ -200,7 +225,9 @@ class Bot:
             aim, fire = [math.atan2(ty - y, tx - x), math.atan2(tz - z - 2.5, flat)], [True, True]
         else:
             aim, fire = [math.atan2(nc[1] - y, nc[0] - x), 0.0], [False, False]
-            farm = self._farm_target(obs, me, npcs, t, healthy) if config.LOOT else None
+            farm = None
+            if config.LOOT:
+                farm = self._farm_target(obs, me, npcs, t, crates_ok, drones_ok)
             if farm is not None:
                 aim, fire, firing = self._gunnery(me, None, farm, t)
 
@@ -271,6 +298,8 @@ class Bot:
             if kind == "damaged":
                 if e["weapon"] == "npc":
                     self.npc_hurt_t = t
+                    if e.get("by") is not None:
+                        self.drone_hits[e["by"]] = t
                 elif e.get("by") is not None:
                     self.attackers[e["by"]] = t
                     self.hurt_t = t
@@ -501,7 +530,19 @@ class Bot:
         bearing = math.atan2(y - py, x - px)
         return self._steer(x, y, bearing + math.pi / 2)
 
-    def _loot(self, obs: dict, me: dict, npcs: list, t: float, healthy: bool):
+    def _swarmed(self, npcs: list, x: float, y: float, t: float) -> bool:
+        """Are two or more drones shooting at me? Once they are, stay clear for SWARM_S."""
+        reach = self.cfg["npc"]["deaggro_range"]
+        on_me = 0
+        for npc in npcs:
+            to_me = math.atan2(y - npc["pos"][1], x - npc["pos"][0])
+            aimed = npc["_d"] < reach and abs(wrap(npc["aim"][0] - to_me)) < 0.25
+            on_me += aimed or t - self.drone_hits.get(npc["id"], -99) < 3
+        if on_me >= 2:
+            self.swarm_until = t + SWARM_S
+        return t < self.swarm_until
+
+    def _loot(self, obs: dict, me: dict, npcs: list, t: float, crates: bool, drones: bool):
         """(x, y, stop distance) of the most worthwhile thing nearby, or None."""
         x, y, z = me["pos"]
         zone = obs["zone"]
@@ -528,9 +569,10 @@ class Bot:
         for drop in obs["drops"]:
             if drop["lands_in"] < 12 and drop.get("holder") in (None, me["id"]):
                 consider(drop, 130, 1.5, -60)
-        if healthy:
+        if crates:
             for crate in obs["crates"]:
                 consider(crate, 80, 30, 0)
+        if drones:
             for npc in npcs:
                 consider(npc, 80, 40, 10)
         if best is None:
@@ -542,15 +584,15 @@ class Bot:
         return best
 
     # ------------------------------------------------------------------ torso
-    def _farm_target(self, obs: dict, me: dict, npcs: list, t: float, healthy: bool):
+    def _farm_target(self, obs: dict, me: dict, npcs: list, t: float, crates: bool, drones: bool):
         """A drone or crate worth shooting for its cubes while no mech is around."""
         x, y, z = me["pos"]
         nav = self.nav
         options = []
         for npc in npcs:
-            if npc["_d"] < 70 and (healthy or t - self.npc_hurt_t < 2):
+            if npc["_d"] < 70 and (drones or t - self.npc_hurt_t < 2):
                 options.append((npc["_d"], npc, "npc"))
-        if healthy:
+        if crates:
             for crate in obs["crates"]:
                 d = math.hypot(crate["pos"][0] - x, crate["pos"][1] - y)
                 if d < 60 and crate["id"] not in self.skip and not self._on_roof(crate["pos"], z):
