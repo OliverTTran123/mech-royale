@@ -19,6 +19,7 @@ from nav import Nav
 TWO_PI = 2 * math.pi
 FIELD_CELLS_PER_TICK = 4000  # flow-field work per decision, about 2 ms
 ENGAGE = 170.0  # mechs closer than this are threats and targets
+LASER_CLOSE = 40.0  # inside this, the gun fires; a laser holds for a full beam past it
 WANTED = ("laser", "lightning")  # a mortar is skipped: it invites laser cook-off
 EARLY_S = 90.0  # opening: detour for a weapon even with a mech nearby
 UPGRADES = [  # most wanted first: staying alive, then damage
@@ -188,7 +189,8 @@ class Bot:
             farm = None
             if config.LOOT and calm and focus is None:
                 farm = self._farm_target(obs, me, npcs, t, healthy)
-            aim, fire, firing = self._gunnery(me, focus, farm, t)
+            laser_at = self._laser_mark(me, mechs)
+            aim, fire, firing = self._gunnery(me, focus, farm, t, laser_at)
             if aim is None:
                 aim = [self._look(obs["sounds"], me, t, yaw), 0.0]
         elif mechs:
@@ -543,58 +545,99 @@ class Bot:
         flat = math.hypot(dx, dy)
         return math.atan2(dy, dx), math.atan2(dz, flat), flat
 
-    def _gunnery(self, me: dict, target: dict | None, farm: dict | None, t: float):
+    def _laser_mark(self, me: dict, mechs: list) -> dict | None:
+        """The weakest mech a full laser beam can hit, past the range where the gun is better."""
+        laser = next((w for w in me["weapons"] if w and w["kind"] == "laser"), None)
+        if laser is None:
+            return None
+        reach = laser["stats"]["range"] * 0.95
+        x, y, _ = me["pos"]
+        nav = self.nav
+        far = [
+            m
+            for m in mechs
+            if LASER_CLOSE < m["_d"] <= reach
+            and not (nav and nav.hidden(x, y, m["pos"][0], m["pos"][1]))
+        ]
+        if not far:
+            return None
+        return min(far, key=lambda m: (m.get("hp", self.full_hp), m["_d"]))
+
+    def _gunnery(
+        self,
+        me: dict,
+        target: dict | None,
+        farm: dict | None,
+        t: float,
+        laser_at: dict | None = None,
+    ):
         """(aim or None, fire flags, whether the gun is being fired)."""
         fire = [False, False]
         aim_at = target or farm
-        if aim_at is None:
+        if aim_at is None and laser_at is None:
             return None, fire, False
         x, y, _ = me["pos"]
         nav = self.nav
-        grow = 1 + self.cfg["cubes"]["size_per_cube"] * aim_at.get("cubes", 0)
-        half_w = self.half_width[aim_at["kind"]] * grow
-        half_h = self.half_height[aim_at["kind"]] * grow
-        d = aim_at["_d"]
-        seen = not (nav and nav.hidden(x, y, aim_at["pos"][0], aim_at["pos"][1]))
         now_yaw, now_pitch = me["aim"]
         aim = None
         firing = False
 
-        def on_target(sol: tuple[float, float, float], slack: float) -> bool:
-            flat = max(sol[2], 1.0)
-            return (
-                abs(wrap(sol[0] - now_yaw)) < math.atan2(half_w * 0.9, flat) + slack
-                and abs(sol[1] - now_pitch) < math.atan2(half_h * 0.9, flat) + slack
-            )
+        if aim_at is not None:
+            grow = 1 + self.cfg["cubes"]["size_per_cube"] * aim_at.get("cubes", 0)
+            half_w = self.half_width[aim_at["kind"]] * grow
+            half_h = self.half_height[aim_at["kind"]] * grow
+            d = aim_at["_d"]
+            seen = not (nav and nav.hidden(x, y, aim_at["pos"][0], aim_at["pos"][1]))
 
-        for slot, weapon in enumerate(me["weapons"]):
-            if not weapon:
-                continue
-            kind, stats = weapon["kind"], weapon["stats"]
-            if kind == "gun":
-                lead = self._solution(me, aim_at, stats["speed"])
-                aim = aim or [lead[0], lead[1]]
-                ready = weapon["ammo"] > 0 and not weapon["reload"] and d < stats["range"] * 0.95
-                if ready and seen and on_target(lead, 0.05):
-                    fire[slot] = firing = True
-            elif kind == "lightning" and target is not None:
-                direct = self._solution(me, target, None)
-                near = d < stats["range"] - 2 and abs(wrap(direct[0] - now_yaw)) < 0.2
-                fire[slot] = near and seen and me["energy"] > stats["energy"]
-            elif kind == "laser" and target is not None:
-                direct = self._solution(me, target, None)
+            def on_target(sol: tuple[float, float, float], slack: float) -> bool:
+                flat = max(sol[2], 1.0)
+                return (
+                    abs(wrap(sol[0] - now_yaw)) < math.atan2(half_w * 0.9, flat) + slack
+                    and abs(sol[1] - now_pitch) < math.atan2(half_h * 0.9, flat) + slack
+                )
+
+            for slot, weapon in enumerate(me["weapons"]):
+                if not weapon:
+                    continue
+                kind, stats = weapon["kind"], weapon["stats"]
+                if kind == "gun":
+                    lead = self._solution(me, aim_at, stats["speed"])
+                    aim = aim or [lead[0], lead[1]]
+                    ready = (
+                        weapon["ammo"] > 0 and not weapon["reload"] and d < stats["range"] * 0.95
+                    )
+                    if ready and seen and on_target(lead, 0.05):
+                        fire[slot] = firing = True
+                elif kind == "lightning" and target is not None:
+                    direct = self._solution(me, target, None)
+                    near = d < stats["range"] - 2 and abs(wrap(direct[0] - now_yaw)) < 0.2
+                    fire[slot] = near and seen and me["energy"] > stats["energy"]
+
+        if laser_at is not None:
+            for slot, weapon in enumerate(me["weapons"]):
+                if not weapon or weapon["kind"] != "laser":
+                    continue
+                direct = self._solution(me, laser_at, None)
                 charge = weapon.get("charge", 0)
-                full = stats["charge"]
+                full = weapon["stats"]["charge"]
+                grow = 1 + self.cfg["cubes"]["size_per_cube"] * laser_at.get("cubes", 0)
+                half_w = self.half_width[laser_at["kind"]] * grow
+                half_h = self.half_height[laser_at["kind"]] * grow
+                flat = max(direct[2], 1.0)
+                lined = abs(wrap(direct[0] - now_yaw)) < math.atan2(half_w * 0.9, flat) and abs(
+                    direct[1] - now_pitch
+                ) < math.atan2(half_h * 0.9, flat)
                 if charge > 0:
                     if charge >= full - 0.15:
                         aim = [direct[0], direct[1]]  # the beam is instant: stop leading
-                    fire[slot] = not (charge >= full - 0.06 and on_target(direct, 0.0))
+                    fire[slot] = not (charge >= full - 0.06 and lined)
                 else:
                     usable = weapon["cooldown"] <= 0.05 and t >= self.laser_off_until
-                    safe = not self.retreat and me["in_zone"]
-                    fire[slot] = usable and safe and seen and d < stats["range"] * 0.95
-        if aim is None:  # no gun in hand
-            direct = self._solution(me, aim_at, None)
+                    fire[slot] = usable and me["in_zone"]
+                break
+
+        if aim is None:  # no gun in hand, or only a laser target
+            direct = self._solution(me, aim_at or laser_at, None)
             aim = [direct[0], direct[1]]
         return aim, fire, firing
 
