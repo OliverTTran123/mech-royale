@@ -16,6 +16,12 @@ THREAT_RETREAT = False  # stand and shoot; do not back off, circle, or dodge she
 # Off (starter): take the first non-gun weapon in reach, always pick upgrade 0, never detour.
 LOOT = True
 
+# Roof camp. On: after the opening (3 cubes or 60 s) jet onto the roof inside the next circle that
+# hides the mech best from the ground, stand back from its edges, shoot what gets a line of sight,
+# step out of sight to heal when hurt, and change roofs when the circle leaves this one (ground
+# cover if it holds no roof). Off: fight on the ground all match.
+ROOF_CAMP = True
+
 # Torso. On: aim at the mech that is cheapest to kill, lead the shot, fire only when aligned, charge
 # and release the laser, reload between fights, look around when nothing is in sight.
 # Off (starter): aim straight at the nearest mech and hold both triggers; else face the next center.

@@ -12,6 +12,7 @@ from array import array
 
 CELL = 2.0  # meters per grid cell
 UNSEEN = 65535
+NO_ROOF = -32768  # `top` value of a cell with no building over it
 STEEP_CM = 130  # a 1 m terrain edge rising more than this cannot be walked (50 deg is 119 cm)
 SOLID_ABOVE = 1.5  # a prism top this far above the ground is a wall, not a step
 SIGHT_ABOVE = 9.0  # a prism top this far above the ground hides a mech
@@ -35,6 +36,7 @@ class Nav:
         n = self.w * self.h
         raw = bytearray(n)  # the mech's center cannot be inside these
         self.tall = bytearray(n)  # these block sight
+        self.top = array("h", [NO_ROOF]) * n  # highest roof over the cell, cm above sea level
         self._mark_steep(raw)
         for prism in world["prisms"]:
             self._fill_prism(prism, raw)
@@ -86,6 +88,7 @@ class Nav:
                     ground = self.heights[(2 * j + 1) * self.tnx + 2 * i + 1] / 100
                     if top - ground > SOLID_ABOVE:
                         raw[j * w + i] = 1
+                        self.top[j * w + i] = max(self.top[j * w + i], min(32767, int(top * 100)))
                         if top - ground >= SIGHT_ABOVE and base - ground < SIGHT_ABOVE / 2:
                             tall[j * w + i] = 1
 
@@ -158,6 +161,114 @@ class Nav:
     def hidden(self, x0: float, y0: float, x1: float, y1: float) -> bool:
         """Does a tall building stand between the two points?"""
         return self._ray(self.tall, x0, y0, x1, y1, False)
+
+    # ------------------------------------------------------------------ roofs
+    def roof(self, x: float, y: float) -> float | None:
+        """Height of the roof over (x, y), or None on open ground."""
+        top = self.top[self.cell(x, y)]
+        return None if top == NO_ROOF else top / 100
+
+    def hidden3(self, x0, y0, z0, x1, y1, z1, step: float = 1.0) -> bool:
+        """Does a roof stand in the straight line between two points in space, sampled every
+        `step` meters? Unlike `hidden` this knows heights, so it works from, onto and over roofs."""
+        dx, dy, dz = x1 - x0, y1 - y0, z1 - z0
+        steps = int(math.hypot(dx, dy) / step) + 1
+        w, h, min_x, min_y, top = self.w, self.h, self.min_x, self.min_y, self.top
+        for k in range(1, steps):
+            f = k / steps
+            i = int((x0 + dx * f - min_x) / CELL)
+            j = int((y0 + dy * f - min_y) / CELL)
+            if not (0 <= i < w and 0 <= j < h):
+                return True
+            roof = top[j * w + i]
+            if roof != NO_ROOF and roof / 100 > z0 + dz * f + 0.3:
+                return True
+        return False
+
+    def flat(self, x0: float, y0: float, x1: float, y1: float, z: float) -> bool:
+        """Does the whole segment lie on roof within 1.5 m of height z (walkable up there)?"""
+        steps = int(math.hypot(x1 - x0, y1 - y0) / CELL) + 1
+        low, high = (z - 1.5) * 100, (z + 1.5) * 100
+        for k in range(steps + 1):
+            f = k / steps
+            if not low < self.top[self.cell(x0 + (x1 - x0) * f, y0 + (y1 - y0) * f)] < high:
+                return False
+        return True
+
+    def roof_edges(self, x: float, y: float, limit: float) -> list[tuple[float, bool]]:
+        """From a roof point along 16 bearings (k * 22.5 degrees): how far its flat roof goes
+        (to a drop, a step of over 1.5 m, or `limit`), and whether that edge drops to open ground
+        that stays open for 8 m, where a mech can stand to jet up. Empty if the roof ends
+        nearer than `limit` on any bearing, or off a roof."""
+        top = self.top
+        here = top[self.cell(x, y)]
+        if here == NO_ROOF:
+            return []
+        edges = []
+        for k in range(16):
+            ux, uy = math.cos(k * math.pi / 8), math.sin(k * math.pi / 8)
+            d = CELL
+            while d < 60.0:
+                there = top[self.cell(x + d * ux, y + d * uy)]
+                if there == NO_ROOF or abs(there - here) > 150:
+                    break
+                d += CELL
+            if d < limit:
+                return []
+            beyond = (top[self.cell(x + (d + m) * ux, y + (d + m) * uy)] for m in (0, 2, 4, 6, 8))
+            edges.append((d, d < 60.0 and all(cell == NO_ROOF for cell in beyond)))
+        return edges
+
+    def exposure(
+        self, x: float, y: float, height: float, reach: float = 150.0
+    ) -> tuple[int, float]:
+        """How open ground sees a mech `height` tall standing on the roof at (x, y), looking from
+        every 2 m along 16 bearings out to `reach`: (seen, hides).
+
+        `seen` counts the ground points from which a mech's eye has a line over the roofs in
+        between to the stander's top or center; a point within 80 m counts three times, as that
+        is where a mech with a line of sight stops to shoot. `hides` is how far from the walls
+        of this roof the nearest such point is: mechs closer to the building see nothing.
+
+        Marching outward, a roof cell at distance r hides everything beyond it that lies below
+        the line from the stander through its top, so one running maximum of that slope per
+        bearing answers every distance at once."""
+        w, h, min_x, min_y, top, raw = self.w, self.h, self.min_x, self.min_y, self.top, self.raw
+        heights, tnx = self.heights, self.tnx
+        here = top[self.cell(x, y)]
+        if here == NO_ROOF:
+            return 0, 0.0
+        crown = here + int(height * 100)  # cm, like the grids
+        middle = here + int(height * 50)
+        eye = 800
+        steps = int(reach / CELL)
+        seen, hides = 0, steps
+        px, py = (x - min_x) / CELL, (y - min_y) / CELL  # in cells, as is each step
+        for k in range(16):
+            ux, uy = math.cos(k * math.pi / 8), math.sin(k * math.pi / 8)
+            over_crown = over_middle = -1e9  # steepest slope to a roof passed so far, cm per step
+            edge = 0  # the step at which this roof ended
+            for n in range(1, steps + 1):
+                i, j = int(px + ux * n), int(py + uy * n)
+                if not (0 < i < w - 1 and 0 < j < h - 1):
+                    break
+                c = j * w + i
+                roof = top[c]
+                if not edge and abs(roof - here) > 150:
+                    edge = n
+                if roof != NO_ROOF:
+                    slope = (roof - crown) / n
+                    if slope > over_crown:
+                        over_crown = slope
+                    slope = (roof - middle) / n
+                    if slope > over_middle:
+                        over_middle = slope
+                elif not raw[c]:
+                    looker = heights[(2 * j + 1) * tnx + 2 * i + 1] + eye
+                    if (looker - crown) / n > over_crown or (looker - middle) / n > over_middle:
+                        seen += 3 if n <= 40 else 1
+                        hides = min(hides, n - edge)
+        return seen, hides * CELL
 
     # ------------------------------------------------------------------ flow field
     def set_goal(self, x: float, y: float) -> None:

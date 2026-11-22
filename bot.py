@@ -3,7 +3,9 @@
 - zone: be inside the next circle before the current one starts to shrink;
 - threats: back off behind cover when outnumbered or losing, and let health regenerate;
 - loot: collect cubes, a laser or lightning, and supply drops while nobody is near;
-- targets: shoot the mech that is cheapest to kill, leading the shot.
+- targets: shoot the mech that is cheapest to kill, leading the shot;
+- roof camp: after the opening, jet onto the roof in the next circle that the least ground can
+  see, stand back from its edges, and change roofs when the circle moves on.
 
 Legs and torso are independent, so movement and aim are decided separately each decision.
 Each rule has a flag in config.py; with a flag off, that part does what the kit's starter does.
@@ -11,10 +13,11 @@ Each rule has a flag in config.py; with a flag off, that part does what the kit'
 
 import math
 import random
+from typing import NamedTuple
 
 import config
 import mechfight as mf
-from nav import Nav
+from nav import NO_ROOF, Nav
 
 TWO_PI = 2 * math.pi
 FIELD_CELLS_PER_TICK = 4000  # flow-field work per decision, about 2 ms
@@ -26,6 +29,17 @@ SWARM_S = 5.0  # two drones shooting at me: stay clear of drones this long
 CUBE_M = 70.0  # walk to a cube this close at any health, even with a mech nearby
 CUBE_GIVE_UP_S = 15.0  # still walking at the same cube after this long: it cannot be reached
 LIGHTNING_CLOSE = 38.0  # holding lightning: walk at the target until it is inside the arc
+CAMP_CUBES = 3  # roof camp: farm the opening until this many cubes ...
+CAMP_S = 60.0  # ... or this long, then go up
+ROOF_LOW_M, ROOF_HIGH_M = 9.0, 50.0  # roofs worth it: above a ground mech's eye, within one jet
+ROOF_SETBACK_M = 6.0  # a camp spot is at least this far from every edge of its roof
+ROOF_HIDES_M = 8.0  # ... and no mech on the ground this near its walls sees the camper at all
+ROOF_GRID = 4  # camp spots are looked for every this many map cells (8 m)
+CAMP_HEIGHT_M = 11.7  # how tall the camper is taken to be when counting who sees it (6 cubes)
+CLIMB_ENERGY = 80.0  # start a climb with this much: it lifts about 53 m
+CAMP_GIVE_UP_S = 20.0  # no nearer the chosen roof after this long: it cannot be reached
+HIDE_HP, HEALED_HP = 0.55, 0.9  # on a roof: below the first, out of sight until above the second
+CAMP_TRIES = 3  # roofs given up on before the rest of the match is fought on the ground
 UPGRADES = [  # most wanted first: less reloading, then gun damage, then staying alive
     "gun_mag", "gun_damage", "gun_rate", "armor", "plating", "nanites", "servos", "laser_damage",
     "lightning_efficiency", "gyros", "laser_charge", "gun_velocity", "lightning_range",
@@ -36,6 +50,20 @@ LOUD = {"gun", "laser", "laser_charge", "lightning", "mortar", "step", "boost", 
 
 def wrap(angle: float) -> float:
     return (angle + math.pi) % TWO_PI - math.pi
+
+
+class Roof(NamedTuple):
+    """A spot to camp on: flat roof all around it, and ground beside the building to jet from."""
+
+    x: float
+    y: float
+    z: float  # height of the roof
+    back: float  # distance to the nearest edge of the roof
+    seen: int  # how many ground points see a mech standing here (nav.exposure)
+    ways: tuple[tuple[float, float], ...]  # ground points to walk to and jet up from
+
+
+ROOFS_BY_MAP: dict[str, list[Roof]] = {}  # map folder -> its camp spots (2 s to find, so once)
 
 
 class Bot:
@@ -86,6 +114,32 @@ class Bot:
         self.cube_id = -1
         self.cube_since = 0.0
         self.skip: set[int] = set()  # loot given up on
+        # roof camp: every spot worth standing on, found once from the map
+        self.roofs: list[Roof] = []
+        if self.nav and config.ROOF_CAMP:
+            map_dir = hello["map"]["dir"]
+            if map_dir not in ROOFS_BY_MAP:
+                ROOFS_BY_MAP[map_dir] = self._roof_spots()
+            self.roofs = ROOFS_BY_MAP[map_dir]
+        self.camp: Roof | None = None  # the roof spot being walked to, climbed to, or held
+        self.left: Roof | None = None  # the one before it, which the next circle no longer holds
+        self.camp_boost = False  # running for `camp` with mechs close behind
+        self.lying_low = False  # hurt and unseen on a roof: hold fire so that health comes back
+        self.camp_key: tuple | None = None  # the circle (and failures) `camp` was chosen for
+        self.camp_bad: list[Roof] = []  # roofs that could not be reached
+        self.camp_since = 0.0  # when the mech last got nearer to `camp`
+        self.camp_left = 1e9  # the nearest it has been, in meters to go
+        self.way: tuple[float, float] | None = None  # ground walked to: below `camp`, or cover
+        self.lined_up = False  # reached `way`: from here it is straight at the roof and up
+        self.rush = False  # late for the next circle: the map leads to its center until inside
+        self.roof_item = -1  # the cube or weapon being fetched on the roof ...
+        self.roof_item_since = 0.0  # ... since when
+        self.healing = False  # hurt on the roof: staying out of sight until healed
+        self.hide_at = (0.0, 0.0, 0)  # where on the roof to do that, and how seen it still is
+        self.hide_until = 0.0  # when to look for a better place
+        self.aloft = False  # standing on a roof this decision
+        self.climb_to: float | None = None  # roof height being jetted up to ...
+        self.climb_yaw: float | None = None  # ... on this heading
 
     # ------------------------------------------------------------------ one decision
     def act(self, obs: mf.Observation) -> mf.Action:
@@ -97,9 +151,14 @@ class Bot:
         zone = obs["zone"]
         nav = self.nav
         if nav and config.ZONE:
-            nav.set_goal(zone["next_center"][0], zone["next_center"][1])
+            # roof camp: once inside the next circle, the map leads to the ground below the roof
+            goal = zone["next_center"] if self.way is None or self.rush else self.way
+            nav.set_goal(goal[0], goal[1])
             nav.work(FIELD_CELLS_PER_TICK)
         self._events(obs["events"], t)
+        roof = nav.roof(x, y) if nav and config.ROOF_CAMP else None
+        self.aloft = roof is not None and bool(me["grounded"]) and abs(z - roof) < 2.5
+        self.lying_low = False
 
         mechs, npcs = [], []
         for m in obs["mechs"]:
@@ -122,7 +181,9 @@ class Bot:
             self.retreat = False
         focus = None  # the threat to circle and, with TARGETING, to shoot
         if threats and config.TARGETING:
-            focus = min(threats, key=lambda m: self._kill_cost(m, t))
+            # from a roof most of them are behind its edge: one that can be hit comes first
+            open_to_me = [m for m in threats if self._sees(me, m)] if self.aloft else threats
+            focus = min(open_to_me or threats, key=lambda m: self._kill_cost(m, t))
         elif threats:
             focus = threats[0]
 
@@ -160,6 +221,19 @@ class Bot:
             loot = self._loot(obs, me, npcs, t, crates_ok, drones_ok)
         if config.THREAT_RETREAT:
             dodge = self._shell_dodge(obs["projectiles"], x, y, z)
+        camping, camp_yaw = False, None
+        if urgent:
+            self.rush = True
+        elif d_out < -5:
+            self.rush = False
+        if self.roofs and (me["cubes"] >= CAMP_CUBES or t >= CAMP_S):  # the opening is over
+            self._camp_plan(me, zone, t)
+            if not urgent:
+                camping, camp_yaw = self._camp(obs, me, mechs, zone, t)
+        # on the roof, in the air, or at its wall: nothing on the ground is worth coming down for
+        roofward = camping and (self.aloft or self.lined_up or not me["grounded"])
+        if roofward:
+            away = []
         yaw: float | None = None
         boost = False
         starter_legs = False
@@ -168,6 +242,8 @@ class Bot:
         elif urgent:
             yaw = self._toward(me, nc[0], nc[1], True)
             boost = not me["in_zone"] or t >= zone["shrink_start"]
+        elif roofward:
+            yaw, boost = camp_yaw, self.camp_boost
         elif weapon is not None and math.hypot(weapon[0] - x, weapon[1] - y) > 1.5:
             yaw = self._toward(me, weapon[0], weapon[1], False)
         elif drop is not None:
@@ -177,6 +253,8 @@ class Bot:
             boost = away[0]["_d"] < self.cfg["npc"]["aggro_range"]
         elif cube is not None and math.hypot(cube[0] - x, cube[1] - y) > 1.5:
             yaw = self._toward(me, cube[0], cube[1], False)
+        elif camping:  # still on the ground: a weapon, a drop or a cube came first, a chase not
+            yaw, boost = camp_yaw, self.camp_boost
         elif config.THREAT_RETREAT and self.retreat and threats:
             yaw = self._flee(me, threats, zone, t)
             boost = threats[0]["_d"] < 120
@@ -215,6 +293,12 @@ class Bot:
                 boost = True
         else:
             jump = obs["tick"] % 40 == 0
+        if self.climb_to is not None:  # roof camp: this climb is flown on purpose, not by stalling
+            above = z > self.climb_to + 1.0 and nav is not None and nav.roof(x, y) is not None
+            if yaw is None or yaw != self.climb_yaw or above or me["energy"] < 4:
+                self.climb_to = None
+            else:
+                jump, boost = bool(me["grounded"]), True
         if boost and me["energy"] < 2:
             boost = False
         if starter_legs:
@@ -228,9 +312,12 @@ class Bot:
         elif config.TARGETING:
             farm = None
             if config.LOOT and calm and (focus is None or farming):
-                farm = self._farm_target(obs, me, npcs, t, crates_ok, drones_ok)
+                # from a roof a drone is shot only in defense: its cubes would fall out of reach
+                farm = self._farm_target(obs, me, npcs, t, crates_ok, drones_ok and not self.aloft)
             target = None if farming and farm is not None else focus
             aim, fire, firing = self._gunnery(me, target, farm, t)
+            if self.lying_low:  # dealing damage would put off the healing
+                fire, firing = [False, False], False
             if aim is None:
                 aim = [self._look(obs["sounds"], me, t, yaw), 0.0]
         elif mechs:
@@ -567,6 +654,272 @@ class Bot:
         bearing = math.atan2(y - py, x - px)
         return self._steer(x, y, bearing + math.pi / 2)
 
+    # ------------------------------------------------------------------ roof camp
+    def _roof_spots(self) -> list[Roof]:
+        """Every roof spot worth camping on, from the map: on an 8 m grid, 9 to 50 m above the
+        ground, flat for 6 m or more all around, with ground beside the building to jet up from,
+        and far enough back that no mech standing within 8 m of the walls sees the camper."""
+        nav = self.nav
+        spots = []
+        for j in range(2, nav.h - 2, ROOF_GRID):
+            for i in range(2, nav.w - 2, ROOF_GRID):
+                top = nav.top[j * nav.w + i]
+                if top == NO_ROOF:
+                    continue
+                x, y = nav.center(j * nav.w + i)
+                z = top / 100
+                if not ROOF_LOW_M <= z - nav.ground(x, y) <= ROOF_HIGH_M:
+                    continue
+                edges = nav.roof_edges(x, y, ROOF_SETBACK_M)
+                if not edges:
+                    continue
+                back = min(d for d, _ in edges)
+                ways = []
+                for k, (d, open_ground) in enumerate(edges):
+                    # a wall met nearly square on, with walkable ground one jet or less below
+                    ax = x + (d + 6) * math.cos(k * math.pi / 8)
+                    ay = y + (d + 6) * math.sin(k * math.pi / 8)
+                    walkable = open_ground and not nav.blocked[nav.cell(ax, ay)]
+                    if (
+                        walkable
+                        and d <= 1.5 * back + 4
+                        and 3 <= z - nav.ground(ax, ay) <= ROOF_HIGH_M
+                    ):
+                        ways.append((ax, ay))
+                if ways:
+                    seen, hides = nav.exposure(x, y, CAMP_HEIGHT_M)
+                    if hides >= ROOF_HIDES_M:
+                        spots.append(Roof(x, y, z, back, seen, tuple(ways)))
+        return spots
+
+    @staticmethod
+    def _safe_r(zone: dict) -> float:
+        """The radius around the next center that the legs keep to."""
+        nr = zone["next_radius"]
+        return nr - min(20.0, 0.3 * nr) if nr > 0 else max(2.0, 0.4 * zone["radius"])
+
+    def _inside(self, px: float, py: float, zone: dict, margin: float) -> bool:
+        """Is the point `margin` meters or more inside the radius the legs keep to?"""
+        nc = zone["next_center"]
+        return math.hypot(px - nc[0], py - nc[1]) < self._safe_r(zone) - margin
+
+    def _choose_camp(self, me: dict, zone: dict, t: float) -> None:
+        """Set `camp` and `way`: the roof spot inside the next circle that the least ground sees,
+        marked down for a long walk and for lying far from the center (the circle after this one
+        is then more likely to leave it, and coming down among the mechs waiting below is how a
+        camper dies), and the nearest ground point to jet up to it from."""
+        x, y, _ = me["pos"]
+        cx, cy = zone["next_center"]
+        safe_r = self._safe_r(zone)
+        best, best_way, best_score = None, None, 1e9
+        for spot in self.roofs:
+            out = math.hypot(spot.x - cx, spot.y - cy)
+            score = spot.seen + 0.4 * out
+            if out >= safe_r - 4 or score >= best_score:
+                continue
+            if any(math.hypot(spot.x - bad.x, spot.y - bad.y) < 30 for bad in self.camp_bad):
+                continue
+            for way in spot.ways:
+                total = score + 0.5 * math.hypot(way[0] - x, way[1] - y)
+                if total < best_score and math.hypot(way[0] - cx, way[1] - cy) < safe_r - 1:
+                    best, best_way, best_score = spot, way, total
+        self.camp, self.way = best, best_way
+        self.camp_since, self.camp_left, self.lined_up = t, 1e9, False
+
+    def _cover_spot(self, me: dict, zone: dict) -> tuple[float, float] | None:
+        """Ground to hold when the next circle has no roof: the nearest walkable point inside it
+        with tall buildings on three or more of its eight sides. Looked for out to 48 m from the
+        next center (a small circle is the only kind with no roof), every 4 m, or 8 m in a big
+        one: 170 points at most."""
+        nav = self.nav
+        x, y, _ = me["pos"]
+        cx, cy = zone["next_center"]
+        reach = min(48.0, self._safe_r(zone) - 4.0)
+        step = 4 if reach <= 24 else 8
+        best, best_d = None, 1e9
+        for i in range(-6, 7):
+            for j in range(-6, 7):
+                px, py = cx + step * i, cy + step * j
+                d = math.hypot(px - x, py - y)
+                if (
+                    math.hypot(step * i, step * j) >= reach
+                    or d >= best_d
+                    or nav.blocked[nav.cell(px, py)]
+                ):
+                    continue
+                walls = sum(
+                    nav.tall[nav.cell(px + 8 * ux, py + 8 * uy)]
+                    for ux in (-1, 0, 1)
+                    for uy in (-1, 0, 1)
+                )
+                if walls >= 3:
+                    best, best_d = (px, py), d
+        return best
+
+    def _camp_plan(self, me: dict, zone: dict, t: float) -> None:
+        """Keep `camp` and `way` right for the next circle: when it has left the roof, the best
+        roof inside it; when it holds none, ground cover."""
+        if self.camp is not None and not self._inside(self.camp.x, self.camp.y, zone, 4.0):
+            self.left, self.camp, self.way = self.camp, None, None
+        if self.camp is None and self.way and not self._inside(self.way[0], self.way[1], zone, 1.0):
+            self.way = None
+        nc = zone["next_center"]
+        key = (nc[0], nc[1], zone["next_radius"], len(self.camp_bad))
+        if self.camp is None and key != self.camp_key:  # a new circle, or a roof given up on
+            self.camp_key = key
+            self._choose_camp(me, zone, t)
+            if self.camp is None:
+                self.way = self._cover_spot(me, zone)
+
+    def _roof_item(self, obs: dict, me: dict, roof: float, t: float) -> tuple[float, float] | None:
+        """The nearest cube, or weapon for an empty slot, that can be walked to on this roof."""
+        x, y, _ = me["pos"]
+        items = list(obs["cubes"])
+        if None in me["weapons"]:
+            held = {w["kind"] for w in me["weapons"] if w}
+            items += [p for p in obs["pickups"] if p["kind"] in WANTED and p["kind"] not in held]
+        best, best_d = None, 60.0
+        for item in items:
+            px, py, pz = item["pos"]
+            d = math.hypot(px - x, py - y)
+            if d >= best_d or item["id"] in self.skip or abs(pz - roof) > 3:
+                continue
+            if self.nav.flat(x, y, px, py, roof):
+                best, best_d = item, d
+        if best is None:
+            return None
+        if best["id"] != self.roof_item:
+            self.roof_item, self.roof_item_since = best["id"], t
+        elif t - self.roof_item_since > CUBE_GIVE_UP_S:
+            self.skip.add(best["id"])  # cannot get to it: stop trying
+        return best["pos"][0], best["pos"][1]
+
+    def _watchers(self, px: float, py: float, pz: float, me: dict, mechs: list) -> int:
+        """How well the mechs see me if I stand at this point of a roof: 2 for each whose eye has
+        a line to my center (it can hit me), 1 for each that sees no more than my top."""
+        size = self.cfg["cubes"]["size_per_cube"]
+        height = self.cfg["mech"]["height"] * (1 + size * me["cubes"])
+        eye = self.cfg["mech"]["eye_height"]
+        seen = 0
+        for m in mechs:
+            ex, ey, ez = m["pos"]
+            ez += eye * (1 + size * m.get("cubes", 0))
+            if not self.nav.hidden3(px, py, pz + height / 2, ex, ey, ez, 2.0):
+                seen += 2
+            elif not self.nav.hidden3(px, py, pz + height, ex, ey, ez, 2.0):
+                seen += 1
+        return seen
+
+    def _hide_spot(self, me: dict, mechs: list, roof: float, here: int) -> tuple[float, float, int]:
+        """(x, y, how seen): where within 24 m on this roof the mechs see me least; where I am
+        (seen `here`), unless somewhere is better. A place counts only with 4 m of roof around."""
+        nav = self.nav
+        x, y, _ = me["pos"]
+        best = (x, y, here)
+        best_cost = here * 100.0
+        for k in range(8):
+            ux, uy = math.cos(k * math.pi / 4), math.sin(k * math.pi / 4)
+            for d in (8.0, 16.0, 24.0):
+                px, py = x + d * ux, y + d * uy
+                if not (
+                    nav.flat(x, y, px, py, roof)
+                    and nav.flat(px - 4, py, px + 4, py, roof)
+                    and nav.flat(px, py - 4, px, py + 4, roof)
+                ):
+                    break
+                seen = self._watchers(px, py, roof, me, mechs)
+                if seen * 100 + d < best_cost:
+                    best, best_cost = (px, py, seen), seen * 100 + d
+        return best
+
+    def _hold(self, obs: dict, me: dict, mechs: list, camp: Roof, t: float) -> float | None:
+        """Heading on the camp's roof, or None to stand. Unseen: stand on the spot, or fetch what
+        lies up here. Seen: circle the spot, so that shots miss, and shoot back. Hurt: to where
+        the fewest mechs see me, and hold fire there until healed."""
+        x, y, _ = me["pos"]
+        frac = me["hp"] / me["max_hp"]
+        if frac < HIDE_HP:
+            self.healing = True
+        elif frac >= HEALED_HP:
+            self.healing = False
+        near = sorted((m for m in mechs if m["_d"] < 230), key=lambda m: m["_d"])[:4]
+        here = self._watchers(x, y, camp.z, me, near)
+        if self.healing:
+            self.lying_low = not here
+            if not here:
+                return None
+            if t >= self.hide_until:
+                self.hide_at, self.hide_until = self._hide_spot(me, near, camp.z, here), t + 0.5
+            gx, gy, seen = self.hide_at
+            radius = 3.0
+        else:
+            item = self._roof_item(obs, me, camp.z, t)
+            if item is not None:
+                return math.atan2(item[1] - y, item[0] - x)
+            gx, gy, seen = camp.x, camp.y, here
+            radius = min(5.0, camp.back - 3.0)
+        d = math.hypot(gx - x, gy - y)
+        if not seen or d > radius + 3:
+            return None if d < 1.5 else math.atan2(gy - y, gx - x)
+        tangent = math.atan2(y - gy, x - gx) + math.pi / 2
+        return tangent + max(-0.8, min(0.8, 0.3 * (d - radius)))
+
+    def _camp(
+        self, obs: dict, me: dict, mechs: list, zone: dict, t: float
+    ) -> tuple[bool, float | None]:
+        """(camping?, heading or None to stand). To the ground below the chosen roof, straight at
+        its wall and up, then to the spot set back from its edges; once up, only as far as what
+        lies on the same roof. A roof that the next circle has left is held for as long as the
+        zone allows (the legs' zone rule ends it); then to the next roof, or to ground cover."""
+        nav = self.nav
+        x, y, z = me["pos"]
+        camp = self.camp
+        self.camp_boost = False
+        over = nav.roof(x, y)
+        level = camp is not None and over is not None and abs(over - camp.z) < 1.5
+        if level and z > camp.z - 1.0 and nav.flat(x, y, camp.x, camp.y, camp.z):
+            self.camp_since = t  # on its roof, or about to land on it
+            return True, self._hold(obs, me, mechs, camp, t)
+        old = self.left
+        if old is not None and self.aloft and nav.flat(x, y, old.x, old.y, old.z):
+            return True, self._hold(obs, me, mechs, old, t)  # mechs wait below: no sooner than due
+        if camp is None:
+            if self.way is None:
+                return False, None
+            wx, wy = self.way
+            if math.hypot(wx - x, wy - y) > 4:
+                return True, self._toward(me, wx, wy, True)
+            return True, math.atan2(y - wy, x - wx) + math.pi / 2 + 0.3  # circle it: keep moving
+        left = math.hypot(camp.x - x, camp.y - y) + max(0.0, camp.z - z)
+        if left < self.camp_left - 2:
+            self.camp_left, self.camp_since = left, t
+        elif t - self.camp_since > CAMP_GIVE_UP_S:
+            self.camp_bad.append(camp)  # cannot get up there: another roof next decision
+            self.camp = self.way = None
+            if len(self.camp_bad) >= CAMP_TRIES:
+                self.roofs = []  # climbing does not work here: fight on the ground from now on
+            return False, None
+        wx, wy = self.way
+        d_way = math.hypot(wx - x, wy - y)
+        if d_way < 4:
+            self.lined_up = True
+        elif d_way > 30:
+            self.lined_up = False
+        if not self.lined_up:
+            # mechs close behind: run, and stop in time for the energy to come back for the climb
+            chased = any(m["_d"] < 80 for m in mechs)
+            self.camp_boost = chased and d_way > 60 and me["energy"] > 40 and bool(me["grounded"])
+            return True, self._toward(me, wx, wy, True)
+        yaw = math.atan2(camp.y - y, camp.x - x)  # straight at the wall, then up it
+        below = self.climb_to is None and me["grounded"] and z < camp.z - 1.0
+        if below and not nav.clear(x, y, x + 6 * math.cos(yaw), y + 6 * math.sin(yaw)):  # at it
+            if me["energy"] < CLIMB_ENERGY:
+                return True, None  # wait for the energy to make it in one jet
+            self.climb_to = camp.z
+        if self.climb_to is not None:
+            self.climb_yaw = yaw
+        return True, yaw
+
     def _swarmed(self, npcs: list, x: float, y: float, t: float) -> bool:
         """Are two or more drones shooting at me? Once they are, stay clear for SWARM_S."""
         reach = self.cfg["npc"]["deaggro_range"]
@@ -624,7 +977,6 @@ class Bot:
     def _farm_target(self, obs: dict, me: dict, npcs: list, t: float, crates: bool, drones: bool):
         """A drone or crate worth shooting for its cubes while no mech is around."""
         x, y, z = me["pos"]
-        nav = self.nav
         options = []
         for npc in npcs:
             if npc["_d"] < 70 and (drones or t - self.npc_hurt_t < 2):
@@ -632,14 +984,32 @@ class Bot:
         if crates:
             for crate in obs["crates"]:
                 d = math.hypot(crate["pos"][0] - x, crate["pos"][1] - y)
-                if d < 60 and crate["id"] not in self.skip and not self._on_roof(crate["pos"], z):
+                if self.aloft:  # only the crates up here: a cube on the ground is out of reach
+                    level = abs(crate["pos"][2] - z) < 4
+                else:
+                    level = not self._on_roof(crate["pos"], z)
+                if d < 60 and crate["id"] not in self.skip and level:
                     options.append((d + 20, crate, "crate"))
         for _, item, kind in sorted(options, key=lambda o: o[0]):
-            if not (nav and nav.hidden(x, y, item["pos"][0], item["pos"][1])):
+            item["kind"] = kind
+            if self._sees(me, item):
                 item["_d"] = math.hypot(item["pos"][0] - x, item["pos"][1] - y)
-                item["kind"] = kind
                 return item
         return None
+
+    def _sees(self, me: dict, target: dict) -> bool:
+        """Is the line to the target's center clear of buildings? On the ground the flat sight
+        grid answers; standing on a roof it reads everything as hidden, so heights are used."""
+        nav = self.nav
+        if nav is None:
+            return True
+        x, y, z = me["pos"]
+        tx, ty, tz = target["pos"]
+        if not self.aloft:
+            return not nav.hidden(x, y, tx, ty)
+        grow = 1 + self.cfg["cubes"]["size_per_cube"] * target.get("cubes", 0)
+        tz += self.half_height[target["kind"]] * grow
+        return not nav.hidden3(x, y, z + me["stats"]["muzzle_height"], tx, ty, tz)
 
     def _solution(self, me: dict, target: dict, speed: float | None) -> tuple[float, float, float]:
         """(yaw, pitch, distance) to hit the target's center, leading it for a shot at `speed`
@@ -665,13 +1035,11 @@ class Bot:
         aim_at = target or farm
         if aim_at is None:
             return None, fire, False
-        x, y, _ = me["pos"]
-        nav = self.nav
         grow = 1 + self.cfg["cubes"]["size_per_cube"] * aim_at.get("cubes", 0)
         half_w = self.half_width[aim_at["kind"]] * grow
         half_h = self.half_height[aim_at["kind"]] * grow
         d = aim_at["_d"]
-        seen = not (nav and nav.hidden(x, y, aim_at["pos"][0], aim_at["pos"][1]))
+        seen = self._sees(me, aim_at)
         now_yaw, now_pitch = me["aim"]
         aim = None
         firing = False
