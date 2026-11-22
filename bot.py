@@ -22,7 +22,9 @@ from nav import NO_ROOF, Nav
 TWO_PI = 2 * math.pi
 FIELD_CELLS_PER_TICK = 4000  # flow-field work per decision, about 2 ms
 ENGAGE = 170.0  # mechs closer than this are threats and targets
-WANTED = ("laser", "lightning")  # a mortar is skipped: it invites laser cook-off
+WANTED = ("laser", "lightning")  # a mortar is skipped unless MORTAR is on: a laser cooks it off
+KITE_RANGE = 90.0  # circle a target at this distance when KITE is on
+MORTAR_MIN, MORTAR_MAX = 40.0, 180.0  # lob only inside this; closer, the gun is better
 EARLY_S = 90.0  # opening: detour for a weapon even with a mech nearby, and farm cubes
 FARM_CLEAR = 80.0  # opening: crates and drones come before a mech that is no closer than this
 SWARM_S = 5.0  # two drones shooting at me: stay clear of drones this long
@@ -86,7 +88,7 @@ class Bot:
             "crate": cfg["crates"]["radius"],
         }
         self.nav: Nav | None = None
-        if config.ZONE or config.THREAT_RETREAT or config.LOOT or config.TARGETING:
+        if config.ZONE or config.THREAT_RETREAT or config.LOOT or config.TARGETING or config.KITE:
             try:
                 self.nav = Nav(hello["map"]["dir"])
             except (OSError, ValueError, KeyError) as error:
@@ -143,7 +145,7 @@ class Bot:
 
     # ------------------------------------------------------------------ one decision
     def act(self, obs: mf.Observation) -> mf.Action:
-        if not (config.ZONE or config.THREAT_RETREAT or config.LOOT or config.TARGETING):
+        if not (config.ZONE or config.THREAT_RETREAT or config.LOOT or config.TARGETING or config.ROOF_CAMP or config.KITE or config.MORTAR or config.JUKE):
             return self._starter(obs)
         me = obs["self"]
         t = obs["t"]
@@ -219,7 +221,7 @@ class Bot:
         drop = self._drop_commit(obs, me, mechs, t) if config.LOOT and not urgent else None
         if config.LOOT and calm and not urgent:
             loot = self._loot(obs, me, npcs, t, crates_ok, drones_ok)
-        if config.THREAT_RETREAT:
+        if config.THREAT_RETREAT or config.JUKE:
             dodge = self._shell_dodge(obs["projectiles"], x, y, z)
         camping, camp_yaw = False, None
         if urgent:
@@ -259,6 +261,10 @@ class Bot:
             yaw = self._flee(me, threats, zone, t)
             boost = threats[0]["_d"] < 120
         elif config.THREAT_RETREAT and focus is not None:
+            yaw = self._strafe(me, focus, zone, t)
+        elif config.KITE and focus is not None:
+            yaw = self._strafe(me, focus, zone, t)
+        elif config.JUKE and focus is not None and self._aimed_at_us(focus, x, y):
             yaw = self._strafe(me, focus, zone, t)
         elif (
             focus is not None
@@ -424,7 +430,7 @@ class Bot:
         for p in pickups:
             px, py, pz = p["pos"]
             near = math.hypot(px - x, py - y) < self.reach - 0.3 and abs(pz - z) < 3.7
-            if p["kind"] in WANTED and p["kind"] not in held and near:
+            if p["kind"] in self._wanted() and p["kind"] not in held and near:
                 return p["id"]
         return None
 
@@ -491,7 +497,10 @@ class Bot:
             self.strafe_sign = self.rng.choice((-1, 1))
             self.strafe_until = t + self.rng.uniform(0.6, 1.5)
         held = {w["kind"] for w in me["weapons"] if w}
-        keep = 38.0 if "lightning" in held else 110.0 if "laser" in held else 90.0
+        if config.KITE:
+            keep = KITE_RANGE
+        else:
+            keep = 38.0 if "lightning" in held else 110.0 if "laser" in held else 90.0
         bearing = math.atan2(target["pos"][1] - y, target["pos"][0] - x)
         radial = max(-1.0, min(1.0, (target["_d"] - keep) / 25))
         c = zone["center"]
@@ -605,7 +614,7 @@ class Bot:
         best_key = None
         for pickup in obs["pickups"]:
             kind = pickup["kind"]
-            if kind not in WANTED or kind in held or pickup["id"] in self.skip:
+            if kind not in self._wanted() or kind in held or pickup["id"] in self.skip:
                 continue
             px, py = pickup["pos"][0], pickup["pos"][1]
             if math.hypot(px - center[0], py - center[1]) >= radius:
@@ -615,7 +624,7 @@ class Bot:
             d = math.hypot(px - x, py - y)
             if d > 90:
                 continue
-            key = (0 if kind == "lightning" else 1, d)
+            key = (0 if kind == "lightning" else 2 if kind == "mortar" else 1, d)
             if best_key is None or key < best_key:
                 best_key, best = key, (px, py)
         return best
@@ -777,7 +786,7 @@ class Bot:
         items = list(obs["cubes"])
         if None in me["weapons"]:
             held = {w["kind"] for w in me["weapons"] if w}
-            items += [p for p in obs["pickups"] if p["kind"] in WANTED and p["kind"] not in held]
+            items += [p for p in obs["pickups"] if p["kind"] in self._wanted() and p["kind"] not in held]
         best, best_d = None, 60.0
         for item in items:
             px, py, pz = item["pos"]
@@ -952,7 +961,7 @@ class Bot:
         held = {w["kind"] for w in me["weapons"] if w}
         if None in me["weapons"]:
             for p in obs["pickups"]:
-                if p["kind"] in WANTED and p["kind"] not in held:
+                if p["kind"] in self._wanted() and p["kind"] not in held:
                     consider(p, 90, 0, -30)
         for cube in obs["cubes"]:
             consider(cube, 70, 0, -20)
@@ -1065,6 +1074,11 @@ class Bot:
                 direct = self._solution(me, target, None)
                 near = d < stats["range"] - 2 and abs(wrap(direct[0] - now_yaw)) < 0.2
                 fire[slot] = near and seen and me["energy"] > stats["energy"]
+            elif kind == "mortar" and config.MORTAR and target is not None and MORTAR_MIN <= d <= MORTAR_MAX:
+                yaw = math.atan2(target["pos"][1] - me["pos"][1], target["pos"][0] - me["pos"][0])
+                pitch = self._mortar_pitch(d)
+                aim = [yaw, pitch]
+                fire[slot] = seen and on_target((yaw, pitch, d), 0.02) and me["in_zone"]
             elif kind == "laser" and target is not None:
                 direct = self._solution(me, target, None)
                 charge = weapon.get("charge", 0)
@@ -1081,6 +1095,20 @@ class Bot:
             direct = self._solution(me, aim_at, None)
             aim = [direct[0], direct[1]]
         return aim, fire, firing
+
+    def _wanted(self) -> tuple[str, ...]:
+        return ("laser", "lightning", "mortar") if config.MORTAR else WANTED
+
+    def _aimed_at_us(self, mech: dict, x: float, y: float) -> bool:
+        ex, ey = mech["pos"][0], mech["pos"][1]
+        dist = max(mech.get("_d", math.hypot(ex - x, ey - y)), 1.0)
+        return abs(wrap(mech["aim"][0] - math.atan2(y - ey, x - ex))) < max(0.12, math.atan2(3.0, dist))
+
+    def _mortar_pitch(self, dist: float) -> float:
+        """The low arc that lands a shell at `dist`: range is v² sin(2·pitch) / g."""
+        st = self.cfg["weapons"]["mortar"]
+        v, g = st["speed"], st["gravity"]
+        return 0.5 * math.asin(min(0.999, max(0.0, dist * g / (v * v))))
 
     def _look(self, sounds: list, me: dict, t: float, move_yaw: float | None) -> float:
         """Where to point the torso with nothing to shoot: at whoever hurt me, at a close noise,

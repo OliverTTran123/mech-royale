@@ -22,6 +22,17 @@ LOOT = True
 # cover if it holds no roof). Off: fight on the ground all match.
 ROOF_CAMP = True
 
+# Kite. On: circle one mech at KITE_RANGE instead of standing in the open. Off: stand, and close
+# in only to get lightning inside its arc.
+KITE = False
+
+# Mortar. On: pick one up and lob it. Off: never take a mortar, because a laser cooks it off.
+MORTAR = False
+
+# Juke. On: step aside when a mech is aiming at us, and walk out from under a shell. Off: only
+# the retreat flag does either.
+JUKE = False
+
 # Torso. On: aim at the mech that is cheapest to kill, lead the shot, fire only when aligned, charge
 # and release the laser, reload between fights, look around when nothing is in sight.
 # Off (starter): aim straight at the nearest mech and hold both triggers; else face the next center.
