@@ -26,6 +26,7 @@ SWARM_S = 5.0  # two drones shooting at me: stay clear of drones this long
 CUBE_M = 70.0  # walk to a cube this close at any health, even with a mech nearby
 CUBE_GIVE_UP_S = 15.0  # still walking at the same cube after this long: it cannot be reached
 LIGHTNING_CLOSE = 38.0  # holding lightning: walk at the target until it is inside the arc
+ENDGAME_S = 330.0  # 5:30: with ENDGAME on, stop starting fights and regenerate instead
 UPGRADES = [  # most wanted first: less reloading, then gun damage, then staying alive
     "gun_mag", "gun_damage", "gun_rate", "armor", "plating", "nanites", "servos", "laser_damage",
     "lightning_efficiency", "gyros", "laser_charge", "gun_velocity", "lightning_range",
@@ -89,7 +90,13 @@ class Bot:
 
     # ------------------------------------------------------------------ one decision
     def act(self, obs: mf.Observation) -> mf.Action:
-        if not (config.ZONE or config.THREAT_RETREAT or config.LOOT or config.TARGETING):
+        if not (
+            config.ZONE
+            or config.THREAT_RETREAT
+            or config.LOOT
+            or config.TARGETING
+            or config.ENDGAME
+        ):
             return self._starter(obs)
         me = obs["self"]
         t = obs["t"]
@@ -120,6 +127,10 @@ class Bot:
                 self.retreat = False
         elif t - self.last_threat_t > 3:
             self.retreat = False
+        late = config.ENDGAME and t >= ENDGAME_S
+        if late:  # a new fight is not worth a place; only a mech already shooting us is
+            threats = [m for m in mechs if self._return_fire(m, x, y, t)]
+            threats.sort(key=lambda m: m["_d"])
         focus = None  # the threat to circle and, with TARGETING, to shoot
         if threats and config.TARGETING:
             focus = min(threats, key=lambda m: self._kill_cost(m, t))
@@ -156,7 +167,7 @@ class Bot:
         weapon = self._early_weapon(obs, me, t) if config.LOOT and not urgent else None
         cube = self._near_cube(obs, me, t) if config.LOOT and not urgent else None
         drop = self._drop_commit(obs, me, mechs, t) if config.LOOT and not urgent else None
-        if config.LOOT and calm and not urgent:
+        if config.LOOT and calm and not urgent and not late:
             loot = self._loot(obs, me, npcs, t, crates_ok, drones_ok)
         if config.THREAT_RETREAT:
             dodge = self._shell_dodge(obs["projectiles"], x, y, z)
@@ -177,13 +188,16 @@ class Bot:
             boost = away[0]["_d"] < self.cfg["npc"]["aggro_range"]
         elif cube is not None and math.hypot(cube[0] - x, cube[1] - y) > 1.5:
             yaw = self._toward(me, cube[0], cube[1], False)
+        elif late and mechs and (threats or frac < 0.99):
+            yaw = self._flee(me, threats or mechs, zone, t)  # cover, still inside the circle
         elif config.THREAT_RETREAT and self.retreat and threats:
             yaw = self._flee(me, threats, zone, t)
             boost = threats[0]["_d"] < 120
         elif config.THREAT_RETREAT and focus is not None:
             yaw = self._strafe(me, focus, zone, t)
         elif (
-            focus is not None
+            not late
+            and focus is not None
             and focus["_d"] > LIGHTNING_CLOSE
             and any(w and w["kind"] == "lightning" for w in me["weapons"])
         ):  # the arc reaches 45 m and the bot otherwise fights from further out
@@ -227,7 +241,7 @@ class Bot:
             aim, fire = [facing[0], facing[1]], [False, False]
         elif config.TARGETING:
             farm = None
-            if config.LOOT and calm and (focus is None or farming):
+            if config.LOOT and calm and not late and (focus is None or farming):
                 farm = self._farm_target(obs, me, npcs, t, crates_ok, drones_ok)
             target = None if farming and farm is not None else focus
             aim, fire, firing = self._gunnery(me, target, farm, t)
@@ -240,7 +254,7 @@ class Bot:
         else:
             aim, fire = [math.atan2(nc[1] - y, nc[0] - x), 0.0], [False, False]
             farm = None
-            if config.LOOT:
+            if config.LOOT and not late:
                 farm = self._farm_target(obs, me, npcs, t, crates_ok, drones_ok)
             if farm is not None:
                 aim, fire, firing = self._gunnery(me, None, farm, t)
@@ -340,6 +354,15 @@ class Bot:
             if p["kind"] in WANTED and p["kind"] not in held and near:
                 return p["id"]
         return None
+
+    def _return_fire(self, mech: dict, x: float, y: float, t: float) -> bool:
+        """True when this mech hit us in the last few seconds, or its torso is aimed here."""
+        if self.attackers.get(mech["id"], -99) > t - 4:
+            return True
+        ex, ey = mech["pos"][0], mech["pos"][1]
+        dist = max(mech["_d"], 1.0)
+        aimed = abs(wrap(mech["aim"][0] - math.atan2(y - ey, x - ex)))
+        return aimed < max(0.12, math.atan2(self.cfg["mech"]["radius"], dist))
 
     def _kill_cost(self, m: dict, t: float) -> float:
         """Lower is a better target: little health, close, and already shooting at me."""

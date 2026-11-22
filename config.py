@@ -16,6 +16,11 @@ THREAT_RETREAT = False  # stand and shoot; do not back off, circle, or dodge she
 # Off (starter): take the first non-gun weapon in reach, always pick upgrade 0, never detour.
 LOOT = True
 
+# Endgame. On, from 5:30: do not walk at or shoot a mech that is not already shooting us, move
+# behind cover while hurt so health can regenerate, and still take a supply drop or a cube. The
+# circle still comes first. Off: the rest of the match is played the same way as the opening.
+ENDGAME = False
+
 # Torso. On: aim at the mech that is cheapest to kill, lead the shot, fire only when aligned, charge
 # and release the laser, reload between fights, look around when nothing is in sight.
 # Off (starter): aim straight at the nearest mech and hold both triggers; else face the next center.
