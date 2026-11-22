@@ -11,16 +11,21 @@ Legs and torso are independent, so movement and aim are decided separately each 
 Each rule has a flag in config.py; with a flag off, that part does what the kit's starter does.
 """
 
+import hashlib
 import math
 import random
+import struct
+import time
+from pathlib import Path
 from typing import NamedTuple
 
 import config
 import mechfight as mf
-from nav import NO_ROOF, Nav
+from nav import CELL, NO_ROOF, Nav
 
 TWO_PI = 2 * math.pi
 FIELD_CELLS_PER_TICK = 4000  # flow-field work per decision, about 2 ms
+TICK_BUDGET_S = 0.025  # past this, finish the tick with the cheap ground fight instead
 ENGAGE = 170.0  # mechs closer than this are threats and targets
 WANTED = ("laser", "lightning")  # a mortar is skipped unless MORTAR is on: a laser cooks it off
 KITE_RANGE = 90.0  # circle a target at this distance when KITE is on
@@ -65,7 +70,7 @@ class Roof(NamedTuple):
     ways: tuple[tuple[float, float], ...]  # ground points to walk to and jet up from
 
 
-ROOFS_BY_MAP: dict[str, list[Roof]] = {}  # map folder -> its camp spots (2 s to find, so once)
+ROOFS_BY_MAP: dict[str, list[Roof]] = {}  # map folder -> its camp spots, loaded once
 
 
 class Bot:
@@ -142,10 +147,33 @@ class Bot:
         self.aloft = False  # standing on a roof this decision
         self.climb_to: float | None = None  # roof height being jetted up to ...
         self.climb_yaw: float | None = None  # ... on this heading
+        self.budget_hits = 0  # ticks that gave up the slow fight and played the cheap one
+        self._t0 = 0.0
+        self._fallback = False
 
     # ------------------------------------------------------------------ one decision
+    def _late(self) -> bool:
+        return time.perf_counter() - self._t0 > TICK_BUDGET_S
+
+    def _give_up(self) -> None:
+        """This tick is out of time: the rest of it is the cheap ground fight."""
+        if not self._fallback:
+            self._fallback = True
+            self.budget_hits += 1
+
     def act(self, obs: mf.Observation) -> mf.Action:
-        if not (config.ZONE or config.THREAT_RETREAT or config.LOOT or config.TARGETING or config.ROOF_CAMP or config.KITE or config.MORTAR or config.JUKE):
+        self._t0 = time.perf_counter()
+        self._fallback = False
+        if not (
+            config.ZONE
+            or config.THREAT_RETREAT
+            or config.LOOT
+            or config.TARGETING
+            or config.ROOF_CAMP
+            or config.KITE
+            or config.MORTAR
+            or config.JUKE
+        ):
             return self._starter(obs)
         me = obs["self"]
         t = obs["t"]
@@ -154,11 +182,17 @@ class Bot:
         nav = self.nav
         if nav and config.ZONE:
             # roof camp: once inside the next circle, the map leads to the ground below the roof
-            goal = zone["next_center"] if self.way is None or self.rush else self.way
+            if self._late():
+                self._give_up()
+            goal = (
+                zone["next_center"] if self.way is None or self.rush or self._fallback else self.way
+            )
             nav.set_goal(goal[0], goal[1])
-            nav.work(FIELD_CELLS_PER_TICK)
+            if not self._fallback and nav.work(FIELD_CELLS_PER_TICK, self._t0 + TICK_BUDGET_S):
+                self._give_up()
+        roof_on = config.ROOF_CAMP and not self._fallback
         self._events(obs["events"], t)
-        roof = nav.roof(x, y) if nav and config.ROOF_CAMP else None
+        roof = nav.roof(x, y) if nav and roof_on else None
         self.aloft = roof is not None and bool(me["grounded"]) and abs(z - roof) < 2.5
         self.lying_low = False
 
@@ -228,10 +262,18 @@ class Bot:
             self.rush = True
         elif d_out < -5:
             self.rush = False
-        if self.roofs and (me["cubes"] >= CAMP_CUBES or t >= CAMP_S):  # the opening is over
-            self._camp_plan(me, zone, t)
-            if not urgent:
-                camping, camp_yaw = self._camp(obs, me, mechs, zone, t)
+        if roof_on and self.roofs and (me["cubes"] >= CAMP_CUBES or t >= CAMP_S):
+            if self._late():  # the opening is over, but this tick has no time to climb
+                self._give_up()
+                roof_on = False
+            else:
+                self._camp_plan(me, zone, t)
+                if not urgent:
+                    camping, camp_yaw = self._camp(obs, me, mechs, zone, t)
+                if self._fallback:  # a line-of-sight search ran out of time: stay on the ground
+                    camping, camp_yaw = False, None
+                    self.aloft = False
+                    self.lying_low = False
         # on the roof, in the air, or at its wall: nothing on the ground is worth coming down for
         roofward = camping and (self.aloft or self.lined_up or not me["grounded"])
         if roofward:
@@ -260,11 +302,11 @@ class Bot:
         elif config.THREAT_RETREAT and self.retreat and threats:
             yaw = self._flee(me, threats, zone, t)
             boost = threats[0]["_d"] < 120
-        elif config.THREAT_RETREAT and focus is not None:
-            yaw = self._strafe(me, focus, zone, t)
-        elif config.KITE and focus is not None:
-            yaw = self._strafe(me, focus, zone, t)
-        elif config.JUKE and focus is not None and self._aimed_at_us(focus, x, y):
+        elif focus is not None and (
+            config.THREAT_RETREAT
+            or (not self._fallback and config.KITE)
+            or (not self._fallback and config.JUKE and self._aimed_at_us(focus, x, y))
+        ):
             yaw = self._strafe(me, focus, zone, t)
         elif (
             focus is not None
@@ -299,7 +341,7 @@ class Bot:
                 boost = True
         else:
             jump = obs["tick"] % 40 == 0
-        if self.climb_to is not None:  # roof camp: this climb is flown on purpose, not by stalling
+        if self.climb_to is not None and not self._fallback:  # a climb is flown on purpose
             above = z > self.climb_to + 1.0 and nav is not None and nav.roof(x, y) is not None
             if yaw is None or yaw != self.climb_yaw or above or me["energy"] < 4:
                 self.climb_to = None
@@ -664,10 +706,64 @@ class Bot:
         return self._steer(x, y, bearing + math.pi / 2)
 
     # ------------------------------------------------------------------ roof camp
+    # Precomputed for this arena at every 8 m roof cell from 5 m to 58 m up (the knob range).
+    # Loading it is the startup path; a different map falls back to scanning.
+    _ROOF_FILE = Path(__file__).with_name("roofs.dat")
+    _ROOF_REC = struct.Struct("<HH16B16BHH")
+
     def _roof_spots(self) -> list[Roof]:
-        """Every roof spot worth camping on, from the map: on an 8 m grid, 9 to 50 m above the
-        ground, flat for 6 m or more all around, with ground beside the building to jet up from,
-        and far enough back that no mech standing within 8 m of the walls sees the camper."""
+        """Roof spots worth camping on. This arena loads a table; any other map is scanned."""
+        loaded = self._load_roof_table()
+        if loaded is not None:
+            return loaded
+        return self._scan_roof_spots()
+
+    def _load_roof_table(self) -> list[Roof] | None:
+        # The table is this arena at an 8 m grid, with sight counted for a 11.7 m camper.
+        if ROOF_GRID != 4 or CAMP_HEIGHT_M != 11.7 or CELL != 2.0:
+            return None
+        nav = self.nav
+        path = self._ROOF_FILE
+        if not path.is_file():
+            return None
+        blob = path.read_bytes()
+        if len(blob) < 44 or blob[:4] != b"ROOF":
+            return None
+        tnx, tny = struct.unpack_from("<II", blob, 4)
+        digest = blob[12:44]
+        count = struct.unpack_from("<I", blob, 44)[0]
+        need = 48 + count * self._ROOF_REC.size
+        if tnx != nav.tnx or tny != nav.tny or need != len(blob):
+            return None
+        if hashlib.sha256(nav.heights.tobytes()).digest() != digest:
+            return None
+        spots = []
+        rec = self._ROOF_REC
+        for n in range(count):
+            i, j, *rest = rec.unpack_from(blob, 48 + n * rec.size)
+            d_cells, opens = rest[:16], rest[16:32]
+            seen, hides_steps = rest[32], rest[33]
+            x, y = nav.center(j * nav.w + i)
+            z = nav.top[j * nav.w + i] / 100
+            if not ROOF_LOW_M <= z - nav.ground(x, y) <= ROOF_HIGH_M:
+                continue
+            edges = [(d * CELL, bool(o)) for d, o in zip(d_cells, opens, strict=True)]
+            if any(d < ROOF_SETBACK_M for d, _ in edges):
+                continue
+            back = min(d for d, _ in edges)
+            ways = []
+            for k, (d, open_ground) in enumerate(edges):
+                ax = x + (d + 6) * math.cos(k * math.pi / 8)
+                ay = y + (d + 6) * math.sin(k * math.pi / 8)
+                walkable = open_ground and not nav.blocked[nav.cell(ax, ay)]
+                if walkable and d <= 1.5 * back + 4 and 3 <= z - nav.ground(ax, ay) <= ROOF_HIGH_M:
+                    ways.append((ax, ay))
+            if ways and hides_steps * CELL >= ROOF_HIDES_M:
+                spots.append(Roof(x, y, z, back, seen, tuple(ways)))
+        return spots
+
+    def _scan_roof_spots(self) -> list[Roof]:
+        """The same catalog, measured from the map. Used when roofs.dat is not this arena."""
         nav = self.nav
         spots = []
         for j in range(2, nav.h - 2, ROOF_GRID):
@@ -786,7 +882,9 @@ class Bot:
         items = list(obs["cubes"])
         if None in me["weapons"]:
             held = {w["kind"] for w in me["weapons"] if w}
-            items += [p for p in obs["pickups"] if p["kind"] in self._wanted() and p["kind"] not in held]
+            items += [
+                p for p in obs["pickups"] if p["kind"] in self._wanted() and p["kind"] not in held
+            ]
         best, best_d = None, 60.0
         for item in items:
             px, py, pz = item["pos"]
@@ -811,6 +909,9 @@ class Bot:
         eye = self.cfg["mech"]["eye_height"]
         seen = 0
         for m in mechs:
+            if self._late():
+                self._give_up()
+                return seen
             ex, ey, ez = m["pos"]
             ez += eye * (1 + size * m.get("cubes", 0))
             if not self.nav.hidden3(px, py, pz + height / 2, ex, ey, ez, 2.0):
@@ -1074,7 +1175,13 @@ class Bot:
                 direct = self._solution(me, target, None)
                 near = d < stats["range"] - 2 and abs(wrap(direct[0] - now_yaw)) < 0.2
                 fire[slot] = near and seen and me["energy"] > stats["energy"]
-            elif kind == "mortar" and config.MORTAR and target is not None and MORTAR_MIN <= d <= MORTAR_MAX:
+            elif (
+                kind == "mortar"
+                and config.MORTAR
+                and not self._fallback
+                and target is not None
+                and MORTAR_MIN <= d <= MORTAR_MAX
+            ):
                 yaw = math.atan2(target["pos"][1] - me["pos"][1], target["pos"][0] - me["pos"][0])
                 pitch = self._mortar_pitch(d)
                 aim = [yaw, pitch]
@@ -1102,7 +1209,9 @@ class Bot:
     def _aimed_at_us(self, mech: dict, x: float, y: float) -> bool:
         ex, ey = mech["pos"][0], mech["pos"][1]
         dist = max(mech.get("_d", math.hypot(ex - x, ey - y)), 1.0)
-        return abs(wrap(mech["aim"][0] - math.atan2(y - ey, x - ex))) < max(0.12, math.atan2(3.0, dist))
+        return abs(wrap(mech["aim"][0] - math.atan2(y - ey, x - ex))) < max(
+            0.12, math.atan2(3.0, dist)
+        )
 
     def _mortar_pitch(self, dist: float) -> float:
         """The low arc that lands a shell at `dist`: range is v² sin(2·pitch) / g."""

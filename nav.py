@@ -8,11 +8,13 @@ neighbor lookups never need bounds checks.
 import json
 import math
 import os
+import time
 from array import array
 
 CELL = 2.0  # meters per grid cell
 UNSEEN = 65535
 NO_ROOF = -32768  # `top` value of a cell with no building over it
+_BEARINGS = tuple((math.cos(k * math.pi / 8), math.sin(k * math.pi / 8)) for k in range(16))
 STEEP_CM = 130  # a 1 m terrain edge rising more than this cannot be walked (50 deg is 119 cm)
 SOLID_ABOVE = 1.5  # a prism top this far above the ground is a wall, not a step
 SIGHT_ABOVE = 9.0  # a prism top this far above the ground hides a mech
@@ -195,28 +197,53 @@ class Nav:
                 return False
         return True
 
+    def _at(self, x: float, y: float) -> int:
+        """`top` at the cell holding (x, y), clamped like `cell`."""
+        w, h = self.w, self.h
+        i = int((x - self.min_x) / CELL)
+        j = int((y - self.min_y) / CELL)
+        if i < 0:
+            i = 0
+        elif i >= w:
+            i = w - 1
+        if j < 0:
+            j = 0
+        elif j >= h:
+            j = h - 1
+        return self.top[j * w + i]
+
+    def edge_runs(self, x: float, y: float) -> list[tuple[float, bool]]:
+        """Along 16 bearings: how far the flat roof extends (at most 60 m), and whether that edge
+        drops to open ground for 8 m. Empty when (x, y) is not on a roof."""
+        here = self._at(x, y)
+        if here == NO_ROOF:
+            return []
+        edges = []
+        at = self._at
+        for ux, uy in _BEARINGS:
+            d = CELL
+            while d < 60.0:
+                there = at(x + d * ux, y + d * uy)
+                if there == NO_ROOF or there - here > 150 or here - there > 150:
+                    break
+                d += CELL
+            open_ground = d < 60.0
+            if open_ground:
+                for m in (0, 2, 4, 6, 8):
+                    if at(x + (d + m) * ux, y + (d + m) * uy) != NO_ROOF:
+                        open_ground = False
+                        break
+            edges.append((d, open_ground))
+        return edges
+
     def roof_edges(self, x: float, y: float, limit: float) -> list[tuple[float, bool]]:
         """From a roof point along 16 bearings (k * 22.5 degrees): how far its flat roof goes
         (to a drop, a step of over 1.5 m, or `limit`), and whether that edge drops to open ground
         that stays open for 8 m, where a mech can stand to jet up. Empty if the roof ends
         nearer than `limit` on any bearing, or off a roof."""
-        top = self.top
-        here = top[self.cell(x, y)]
-        if here == NO_ROOF:
+        edges = self.edge_runs(x, y)
+        if not edges or any(d < limit for d, _ in edges):
             return []
-        edges = []
-        for k in range(16):
-            ux, uy = math.cos(k * math.pi / 8), math.sin(k * math.pi / 8)
-            d = CELL
-            while d < 60.0:
-                there = top[self.cell(x + d * ux, y + d * uy)]
-                if there == NO_ROOF or abs(there - here) > 150:
-                    break
-                d += CELL
-            if d < limit:
-                return []
-            beyond = (top[self.cell(x + (d + m) * ux, y + (d + m) * uy)] for m in (0, 2, 4, 6, 8))
-            edges.append((d, d < 60.0 and all(cell == NO_ROOF for cell in beyond)))
         return edges
 
     def exposure(
@@ -233,41 +260,49 @@ class Nav:
         Marching outward, a roof cell at distance r hides everything beyond it that lies below
         the line from the stander through its top, so one running maximum of that slope per
         bearing answers every distance at once."""
-        w, h, min_x, min_y, top, raw = self.w, self.h, self.min_x, self.min_y, self.top, self.raw
+        w, h = self.w, self.h
+        min_x, min_y = self.min_x, self.min_y
+        top, raw = self.top, self.raw
         heights, tnx = self.heights, self.tnx
         here = top[self.cell(x, y)]
         if here == NO_ROOF:
             return 0, 0.0
         crown = here + int(height * 100)  # cm, like the grids
         middle = here + int(height * 50)
-        eye = 800
         steps = int(reach / CELL)
-        seen, hides = 0, steps
-        px, py = (x - min_x) / CELL, (y - min_y) / CELL  # in cells, as is each step
-        for k in range(16):
-            ux, uy = math.cos(k * math.pi / 8), math.sin(k * math.pi / 8)
-            over_crown = over_middle = -1e9  # steepest slope to a roof passed so far, cm per step
+        seen = 0
+        hides = steps
+        px = (x - min_x) / CELL
+        py = (y - min_y) / CELL
+        for ux, uy in _BEARINGS:
+            over_c = over_m = -1e9  # steepest slope to a roof passed so far, cm per step
             edge = 0  # the step at which this roof ended
+            ux_n, uy_n = ux, uy
             for n in range(1, steps + 1):
-                i, j = int(px + ux * n), int(py + uy * n)
+                i = int(px + ux_n)
+                j = int(py + uy_n)
+                ux_n += ux
+                uy_n += uy
                 if not (0 < i < w - 1 and 0 < j < h - 1):
                     break
                 c = j * w + i
                 roof = top[c]
-                if not edge and abs(roof - here) > 150:
+                if not edge and (roof - here > 150 or here - roof > 150):
                     edge = n
                 if roof != NO_ROOF:
                     slope = (roof - crown) / n
-                    if slope > over_crown:
-                        over_crown = slope
+                    if slope > over_c:
+                        over_c = slope
                     slope = (roof - middle) / n
-                    if slope > over_middle:
-                        over_middle = slope
+                    if slope > over_m:
+                        over_m = slope
                 elif not raw[c]:
-                    looker = heights[(2 * j + 1) * tnx + 2 * i + 1] + eye
-                    if (looker - crown) / n > over_crown or (looker - middle) / n > over_middle:
+                    looker = heights[(j << 1) * tnx + tnx + (i << 1) + 1] + 800
+                    if (looker - crown) / n > over_c or (looker - middle) / n > over_m:
                         seen += 3 if n <= 40 else 1
-                        hides = min(hides, n - edge)
+                        dist = n - edge
+                        if dist < hides:
+                            hides = dist
         return seen, hides * CELL
 
     # ------------------------------------------------------------------ flow field
@@ -293,21 +328,48 @@ class Nav:
                         return j * w + i
         return None
 
-    def work(self, budget: int) -> None:
-        """Expand up to `budget` cells of the breadth-first search from the goal."""
+    def work(self, budget: int, deadline: float = 0.0) -> bool:
+        """Expand up to `budget` cells of the breadth-first search from the goal. With a
+        `deadline` (perf_counter), stop on a cell boundary once it has passed and return True.
+        The cells that were expanded are the same ones, in the same order, as a full call."""
         dist, blocked, w = self.dist, self.blocked, self.w
+        now = time.perf_counter
+        checked = 0
         while budget > 0 and self._frontier:
             frontier, nxt, level = self._frontier, self._next, self._level + 1
             end = min(len(frontier), self._pos + budget)
-            budget -= end - self._pos
-            for c in frontier[self._pos : end]:
-                for nb in (c - 1, c + 1, c - w, c + w):
-                    if dist[nb] == UNSEEN and not blocked[nb]:
-                        dist[nb] = level
-                        nxt.append(nb)
-            self._pos = end
-            if end == len(frontier):
+            pos = self._pos
+            append = nxt.append
+            while pos < end:
+                if deadline and checked >= 256:
+                    checked = 0
+                    if now() >= deadline:
+                        self._pos = pos
+                        return True
+                c = frontier[pos]
+                pos += 1
+                checked += 1
+                nb = c - 1
+                if dist[nb] == UNSEEN and not blocked[nb]:
+                    dist[nb] = level
+                    append(nb)
+                nb = c + 1
+                if dist[nb] == UNSEEN and not blocked[nb]:
+                    dist[nb] = level
+                    append(nb)
+                nb = c - w
+                if dist[nb] == UNSEEN and not blocked[nb]:
+                    dist[nb] = level
+                    append(nb)
+                nb = c + w
+                if dist[nb] == UNSEEN and not blocked[nb]:
+                    dist[nb] = level
+                    append(nb)
+            budget -= pos - self._pos
+            self._pos = pos
+            if pos == len(frontier):
                 self._frontier, self._next, self._pos, self._level = nxt, [], 0, level
+        return False
 
     def waypoint(self, x: float, y: float, look: int = 14) -> tuple[float, float] | None:
         """A point to walk straight at that follows the flow field, or None while the field has
